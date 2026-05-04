@@ -41,9 +41,11 @@ type AuthCodeData struct {
 	TenantCode          string    `json:"tenant_code"`
 	RedirectURI         string    `json:"redirect_uri"`
 	Scope               string    `json:"scope"`
+	Nonce               string    `json:"nonce,omitempty"`
 	CodeChallenge       string    `json:"code_challenge"`
 	CodeChallengeMethod string    `json:"code_challenge_method"`
 	IssuedAt            time.Time `json:"issued_at"`
+	AuthTime            time.Time `json:"auth_time"` // 用户密码验证完成时间
 }
 
 // OAuthService 处理 /oauth/* 相关流程。
@@ -107,6 +109,8 @@ type AuthorizeRequest struct {
 	RedirectURI         string
 	Scope               string
 	State               string
+	Nonce               string // OIDC：防 id_token 重放
+	AuthTime            time.Time
 	CodeChallenge       string
 	CodeChallengeMethod string // "S256" / "plain"
 	ResponseType        string // 必须是 "code"
@@ -158,6 +162,11 @@ func (s *OAuthService) IssueCode(ctx context.Context, req AuthorizeRequest, user
 		return nil, err
 	}
 
+	authTime := req.AuthTime
+	if authTime.IsZero() {
+		authTime = time.Now()
+	}
+
 	data := AuthCodeData{
 		ClientID:            req.Client.ClientID,
 		UserID:              user.ID,
@@ -166,9 +175,11 @@ func (s *OAuthService) IssueCode(ctx context.Context, req AuthorizeRequest, user
 		TenantCode:          mainTenant.Code,
 		RedirectURI:         req.RedirectURI,
 		Scope:               req.Scope,
+		Nonce:               req.Nonce,
 		CodeChallenge:       req.CodeChallenge,
 		CodeChallengeMethod: req.CodeChallengeMethod,
 		IssuedAt:            time.Now(),
+		AuthTime:            authTime,
 	}
 	payload, _ := json.Marshal(data)
 
@@ -215,6 +226,8 @@ func (s *OAuthService) ExchangeToken(ctx context.Context, req TokenExchangeReque
 		return s.exchangeAuthorizationCode(ctx, client, req)
 	case model.GrantTypeRefreshToken:
 		return s.exchangeRefreshToken(ctx, client, req)
+	case model.GrantTypeClientCredentials:
+		return s.IssueClientCredentialsToken(ctx, client, req.Scope)
 	default:
 		return nil, ErrUnsupportedGrant
 	}
@@ -267,9 +280,38 @@ func (s *OAuthService) exchangeAuthorizationCode(
 		return nil, err
 	}
 
-	return s.issueTokensForClient(ctx, user, tenant, client, req.IP, req.UserAgent)
+	// 拿用户的 email 给 id_token 用（如果 scope 含 email）
+	email, emailVerified := s.lookupUserEmail(ctx, user.ID)
+
+	return s.issueTokensForClient(ctx, issueTokensInput{
+		User:          user,
+		Tenant:        tenant,
+		Client:        client,
+		IP:            req.IP,
+		UserAgent:     req.UserAgent,
+		Scope:         data.Scope,
+		Nonce:         data.Nonce,
+		AuthTime:      data.AuthTime,
+		Email:         email,
+		EmailVerified: emailVerified,
+	})
 }
 
+// lookupUserEmail 找用户的 primary email 凭证（用于 id_token email claim）。
+// 没有则返回空。verified_at 不为 NULL 视为已验证。
+func (s *OAuthService) lookupUserEmail(ctx context.Context, userID uint64) (string, bool) {
+	var ua model.UserAuth
+	err := s.db.WithContext(ctx).
+		Where("user_id = ? AND auth_type = ?", userID, model.AuthTypeEmail).
+		Order("id ASC").
+		First(&ua).Error
+	if err != nil {
+		return "", false
+	}
+	return ua.Identifier, ua.VerifiedAt != nil
+}
+
+// nolint:unused — exchangeRefreshToken 在 ExchangeToken 里通过 switch 分发调用
 func (s *OAuthService) exchangeRefreshToken(
 	ctx context.Context, client *model.OAuthClient, req TokenExchangeRequest,
 ) (*TokenPair, error) {
@@ -366,10 +408,20 @@ func (s *OAuthService) exchangeRefreshToken(
 	return pair, err
 }
 
-func (s *OAuthService) issueTokensForClient(
-	ctx context.Context, user *model.User, tenant *model.Tenant,
-	client *model.OAuthClient, ip, ua string,
-) (*TokenPair, error) {
+type issueTokensInput struct {
+	User          *model.User
+	Tenant        *model.Tenant
+	Client        *model.OAuthClient
+	IP            string
+	UserAgent     string
+	Scope         string
+	Nonce         string    // OIDC nonce（仅 authorization_code 流）
+	AuthTime      time.Time // 用户密码验证完成时间
+	Email         string
+	EmailVerified bool
+}
+
+func (s *OAuthService) issueTokensForClient(ctx context.Context, in issueTokensInput) (*TokenPair, error) {
 	now := time.Now()
 	refreshRaw, err := utils.RandomHex(32)
 	if err != nil {
@@ -377,38 +429,78 @@ func (s *OAuthService) issueTokensForClient(
 	}
 	familyID := utils.NewULID()
 	session := &model.UserSession{
-		UserID:           user.ID,
-		TenantID:         tenant.ID,
-		ClientID:         client.ClientID,
+		UserID:           in.User.ID,
+		TenantID:         in.Tenant.ID,
+		ClientID:         in.Client.ClientID,
 		RefreshTokenHash: utils.HashRefreshToken(refreshRaw),
 		FamilyID:         familyID,
-		UserAgent:        ua,
-		IP:               ip,
+		UserAgent:        in.UserAgent,
+		IP:               in.IP,
 		IssuedAt:         now,
-		ExpiresAt:        now.Add(time.Duration(client.RefreshTokenTTLSeconds) * time.Second),
+		ExpiresAt:        now.Add(time.Duration(in.Client.RefreshTokenTTLSeconds) * time.Second),
 	}
 	if err := s.sessions.Create(ctx, session); err != nil {
 		return nil, fmt.Errorf("create session: %w", err)
 	}
 
-	ttl := time.Duration(client.AccessTokenTTLSeconds) * time.Second
-	access, _, err := s.signer.SignAccessToken(
-		user.PublicID, tenant.Code, client.ClientID, session.ID,
-		[]string{}, ttl,
+	ttl := time.Duration(in.Client.AccessTokenTTLSeconds) * time.Second
+	access, _, err := s.signer.SignAccessTokenWithScope(
+		in.User.PublicID, in.Tenant.Code, in.Client.ClientID, session.ID,
+		[]string{}, in.Scope, ttl,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("sign access token: %w", err)
 	}
-	return &TokenPair{
+
+	pair := &TokenPair{
 		AccessToken:      access,
 		TokenType:        "Bearer",
 		ExpiresIn:        int64(ttl.Seconds()),
 		RefreshToken:     refreshRaw,
 		RefreshExpiresAt: session.ExpiresAt,
-		UserPublicID:     user.PublicID,
-		TenantCode:       tenant.Code,
-		Nickname:         user.Nickname,
-	}, nil
+		Scope:            in.Scope,
+		UserPublicID:     in.User.PublicID,
+		TenantCode:       in.Tenant.Code,
+		Nickname:         in.User.Nickname,
+	}
+
+	// scope 含 openid → 颁发 id_token（OIDC）
+	scopes := SplitScope(in.Scope)
+	if hasScope(scopes, "openid") {
+		authTime := in.AuthTime
+		if authTime.IsZero() {
+			authTime = now
+		}
+		idToken, err := s.signer.SignIDToken(utils.IDTokenInput{
+			Subject:        in.User.PublicID,
+			Audience:       in.Client.ClientID,
+			Nonce:          in.Nonce,
+			AuthTime:       authTime,
+			Name:           in.User.Nickname,
+			Nickname:       in.User.Nickname,
+			Picture:        in.User.AvatarURL,
+			Email:          in.Email,
+			EmailVerified:  in.EmailVerified,
+			TTL:            ttl,
+			IncludeProfile: hasScope(scopes, "profile"),
+			IncludeEmail:   hasScope(scopes, "email"),
+		})
+		if err != nil {
+			return nil, fmt.Errorf("sign id_token: %w", err)
+		}
+		pair.IDToken = idToken
+	}
+
+	return pair, nil
+}
+
+func hasScope(scopes []string, target string) bool {
+	for _, s := range scopes {
+		if s == target {
+			return true
+		}
+	}
+	return false
 }
 
 // CreateAuthSession 在 oneauth 域种 SSO cookie session。
@@ -432,27 +524,28 @@ func (s *OAuthService) CreateAuthSession(ctx context.Context, user *model.User, 
 	return sid, nil
 }
 
-// VerifyAuthSession 取出 cookie 对应的 user（验证 session 有效）。
-func (s *OAuthService) VerifyAuthSession(ctx context.Context, sid string) (*model.User, error) {
+// VerifyAuthSession 取出 cookie 对应的 user 与 session 元数据（验证 session 有效）。
+// 返回的 authTime 是用户最近一次完成密码验证的时间（OIDC id_token 的 auth_time claim）。
+func (s *OAuthService) VerifyAuthSession(ctx context.Context, sid string) (*model.User, time.Time, error) {
 	if sid == "" {
-		return nil, ErrAuthSessionInvalid
+		return nil, time.Time{}, ErrAuthSessionInvalid
 	}
 	sess, err := s.authSessions.FindActiveBySessionID(ctx, sid)
 	if err != nil {
 		if repository.IsNotFound(err) {
-			return nil, ErrAuthSessionInvalid
+			return nil, time.Time{}, ErrAuthSessionInvalid
 		}
-		return nil, err
+		return nil, time.Time{}, err
 	}
 	user, err := s.users.FindByID(ctx, sess.UserID)
 	if err != nil {
-		return nil, err
+		return nil, time.Time{}, err
 	}
 	if user.Status != model.UserStatusActive {
-		return nil, ErrAuthSessionInvalid
+		return nil, time.Time{}, ErrAuthSessionInvalid
 	}
 	_ = s.authSessions.Touch(ctx, sess.ID)
-	return user, nil
+	return user, sess.CreatedAt, nil
 }
 
 // RevokeAuthSession 撤销 cookie session（用于登出）。
@@ -461,6 +554,210 @@ func (s *OAuthService) RevokeAuthSession(ctx context.Context, sid string) error 
 		return nil
 	}
 	return s.authSessions.Revoke(ctx, sid)
+}
+
+// UserInfoResponse 是 /oauth/userinfo 的响应（OIDC 标准）。
+type UserInfoResponse struct {
+	Sub           string `json:"sub"`
+	Name          string `json:"name,omitempty"`
+	Nickname      string `json:"nickname,omitempty"`
+	Picture       string `json:"picture,omitempty"`
+	Email         string `json:"email,omitempty"`
+	EmailVerified bool   `json:"email_verified,omitempty"`
+	TenantID      string `json:"tenant_id,omitempty"`
+	UpdatedAt     int64  `json:"updated_at,omitempty"`
+}
+
+// BuildUserInfo 给 /oauth/userinfo 用：根据 access_token 的 sub + scope 拼用户信息。
+func (s *OAuthService) BuildUserInfo(ctx context.Context, claims *utils.Claims) (*UserInfoResponse, error) {
+	user, err := s.users.FindByPublicID(ctx, claims.Subject)
+	if err != nil {
+		return nil, err
+	}
+	if user.Status != model.UserStatusActive {
+		return nil, ErrInvalidGrant
+	}
+
+	resp := &UserInfoResponse{
+		Sub:       user.PublicID,
+		TenantID:  claims.TenantID,
+		UpdatedAt: user.UpdatedAt.Unix(),
+	}
+	scopes := SplitScope(claims.Scope)
+	if hasScope(scopes, "profile") {
+		resp.Name = user.Nickname
+		resp.Nickname = user.Nickname
+		resp.Picture = user.AvatarURL
+	}
+	if hasScope(scopes, "email") {
+		email, verified := s.lookupUserEmail(ctx, user.ID)
+		resp.Email = email
+		resp.EmailVerified = verified
+	}
+	return resp, nil
+}
+
+// IntrospectResult 是 /oauth/introspect 的结果（RFC 7662）。
+type IntrospectResult struct {
+	Active    bool   `json:"active"`
+	Scope     string `json:"scope,omitempty"`
+	ClientID  string `json:"client_id,omitempty"`
+	Username  string `json:"username,omitempty"`
+	Sub       string `json:"sub,omitempty"`
+	TokenType string `json:"token_type,omitempty"`
+	Exp       int64  `json:"exp,omitempty"`
+	Iat       int64  `json:"iat,omitempty"`
+	Iss       string `json:"iss,omitempty"`
+	Aud       string `json:"aud,omitempty"`
+	JTI       string `json:"jti,omitempty"`
+	TenantID  string `json:"tenant_id,omitempty"`
+}
+
+// IntrospectToken 接收一个 access_token 字符串，返回它是否有效及元数据。
+// 不需要解密 refresh_token（hash 不可逆，不在这做）。
+func (s *OAuthService) IntrospectToken(ctx context.Context, token string, blocklist BlocklistChecker) (*IntrospectResult, error) {
+	claims, err := s.signer.Verify(token)
+	if err != nil {
+		return &IntrospectResult{Active: false}, nil
+	}
+	// 黑名单检查
+	if blocklist != nil {
+		blocked, err := blocklist.IsBlocked(ctx, claims.ID)
+		if err != nil {
+			return nil, err
+		}
+		if blocked {
+			return &IntrospectResult{Active: false}, nil
+		}
+	}
+	aud := ""
+	if len(claims.Audience) > 0 {
+		aud = claims.Audience[0]
+	}
+	return &IntrospectResult{
+		Active:    true,
+		Scope:     claims.Scope,
+		ClientID:  claims.ClientID,
+		Sub:       claims.Subject,
+		TokenType: "Bearer",
+		Exp:       claims.ExpiresAt.Unix(),
+		Iat:       claims.IssuedAt.Unix(),
+		Iss:       claims.Issuer,
+		Aud:       aud,
+		JTI:       claims.ID,
+		TenantID:  claims.TenantID,
+	}, nil
+}
+
+// BlocklistChecker 让 OAuthService 不直接依赖 blocklist repo（避免循环引用）。
+type BlocklistChecker interface {
+	IsBlocked(ctx context.Context, jti string) (bool, error)
+}
+
+// RevokeAccessToken 把 access_token 的 jti 加入黑名单。
+func (s *OAuthService) RevokeAccessToken(ctx context.Context, token string, blocklist BlocklistAdder) error {
+	claims, err := s.signer.Verify(token)
+	if err != nil {
+		// RFC 7009: 无效 token 也返回 200（避免暴露 token 状态）
+		return nil
+	}
+	now := time.Now()
+	if claims.ExpiresAt.Time.Before(now) {
+		// 已过期，没必要加黑名单
+		return nil
+	}
+
+	// 找到 user_id（claims.Subject 是 public_id）
+	user, err := s.users.FindByPublicID(ctx, claims.Subject)
+	if err != nil {
+		return nil // 用户都没了就不用撤销
+	}
+	return blocklist.Add(ctx, &model.JWTBlocklist{
+		JTI:       claims.ID,
+		UserID:    user.ID,
+		Reason:    model.BlocklistReasonAdminRevoke,
+		RevokedAt: now,
+		ExpiresAt: claims.ExpiresAt.Time,
+	})
+}
+
+// RevokeRefreshToken 撤销 refresh_token（基于 hash 查表）。
+func (s *OAuthService) RevokeRefreshToken(ctx context.Context, token string) error {
+	hash := utils.HashRefreshToken(token)
+	sess, err := s.sessions.FindByRefreshHash(ctx, hash)
+	if err != nil {
+		// RFC 7009: 无效 token 也返回 200
+		return nil
+	}
+	return s.sessions.RevokeFamily(ctx, sess.FamilyID)
+}
+
+// BlocklistAdder 抽象 add 接口（供 RevokeAccessToken 用）。
+type BlocklistAdder interface {
+	Add(ctx context.Context, e *model.JWTBlocklist) error
+}
+
+// IssueClientCredentialsToken 颁发 service token（grant_type=client_credentials）。
+// 没有 user 概念：sub = client_id，无 refresh_token，permissions claim 用 scope 限定。
+func (s *OAuthService) IssueClientCredentialsToken(ctx context.Context,
+	client *model.OAuthClient, requestedScope string,
+) (*TokenPair, error) {
+	if !client.AllowsGrantType(model.GrantTypeClientCredentials) {
+		return nil, ErrUnauthorizedClient
+	}
+	// service client 必须是 confidential（已经通过 secret 验证）
+	if !client.IsConfidential() {
+		return nil, ErrUnauthorizedClient
+	}
+
+	// scope 过滤：只允许 client.AllowedScopes 子集
+	scopes := SplitScope(requestedScope)
+	if len(scopes) == 0 {
+		// 默认给 client 配的全部 internal.* scope
+		scopes = filterInternalScopes(client.AllowedScopes)
+	} else {
+		// 校验请求的 scope 在 allowed 内
+		for _, sc := range scopes {
+			if !contains(client.AllowedScopes, sc) {
+				return nil, ErrInvalidScope
+			}
+		}
+	}
+
+	ttl := time.Duration(client.AccessTokenTTLSeconds) * time.Second
+	// service token 的 sub 是 client_id（不是 user！）
+	access, _, err := s.signer.SignAccessTokenWithScope(
+		client.ClientID, "", client.ClientID, 0,
+		scopes, strings.Join(scopes, " "), ttl,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &TokenPair{
+		AccessToken: access,
+		TokenType:   "Bearer",
+		ExpiresIn:   int64(ttl.Seconds()),
+		Scope:       strings.Join(scopes, " "),
+	}, nil
+}
+
+func contains(arr []string, target string) bool {
+	for _, v := range arr {
+		if v == target {
+			return true
+		}
+	}
+	return false
+}
+
+func filterInternalScopes(allowed []string) []string {
+	var out []string
+	for _, s := range allowed {
+		if strings.HasPrefix(s, "internal.") {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // AuthenticatePassword 用密码验证身份（不创建 session/token，仅返回 user）。
@@ -500,6 +797,11 @@ func (s *OAuthService) AuthenticatePassword(ctx context.Context, email, password
 	}
 	_ = s.auths.MarkUsed(ctx, auth.ID)
 	return user, nil
+}
+
+// JWKS 暴露给 handler 用。
+func (s *OAuthService) JWKS() map[string]any {
+	return s.signer.JWKS()
 }
 
 // ----- helpers -----

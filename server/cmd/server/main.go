@@ -96,15 +96,20 @@ func run(configPath string) error {
 
 	// dev 期 HTTP，Secure cookie 必须 false 浏览器才接受
 	cookieSecure := os.Getenv("COOKIE_SECURE") == "true"
+	// OIDC discovery 用的 issuer URL；dev 期默认从 Host 头推断
+	publicBaseURL := os.Getenv("PUBLIC_BASE_URL")
 
 	// HTTP server
 	srv := server.New(server.Deps{
-		Cfg:          cfg,
-		DB:           db,
-		Cache:        cacheImpl,
-		AuthService:  authSvc,
-		OAuthService: oauthSvc,
-		CookieSecure: cookieSecure,
+		Cfg:           cfg,
+		DB:            db,
+		Cache:         cacheImpl,
+		AuthService:   authSvc,
+		OAuthService:  oauthSvc,
+		Blocklist:     blocklistRepo,
+		BlocklistAdd:  blocklistRepo,
+		CookieSecure:  cookieSecure,
+		PublicBaseURL: publicBaseURL,
 	})
 
 	// 信号处理（优雅关闭）

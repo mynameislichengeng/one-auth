@@ -18,18 +18,34 @@ const CookieName = "oneauth_sid"
 
 // OAuthHandler 实现 /oauth/* 端点 + 登录页。
 type OAuthHandler struct {
-	svc       *service.OAuthService
-	authSvc   *service.AuthService
-	loginTmpl *template.Template
+	svc          *service.OAuthService
+	authSvc      *service.AuthService
+	blocklist    service.BlocklistChecker // for introspect/revoke
+	blocklistAdd service.BlocklistAdder
+	loginTmpl    *template.Template
 	cookieSecure bool
+	publicBaseURL string // for OIDC discovery, e.g., http://localhost:8080
 }
 
-func NewOAuthHandler(svc *service.OAuthService, authSvc *service.AuthService, cookieSecure bool) *OAuthHandler {
+// HandlerConfig 统一传入 OAuthHandler 的依赖。
+type HandlerConfig struct {
+	Service       *service.OAuthService
+	AuthService   *service.AuthService
+	Blocklist     service.BlocklistChecker
+	BlocklistAdd  service.BlocklistAdder
+	CookieSecure  bool
+	PublicBaseURL string
+}
+
+func NewOAuthHandler(cfg HandlerConfig) *OAuthHandler {
 	return &OAuthHandler{
-		svc:          svc,
-		authSvc:      authSvc,
-		loginTmpl:    template.Must(template.New("login").Parse(loginHTML)),
-		cookieSecure: cookieSecure,
+		svc:           cfg.Service,
+		authSvc:       cfg.AuthService,
+		blocklist:     cfg.Blocklist,
+		blocklistAdd:  cfg.BlocklistAdd,
+		loginTmpl:     template.Must(template.New("login").Parse(loginHTML)),
+		cookieSecure:  cfg.CookieSecure,
+		publicBaseURL: cfg.PublicBaseURL,
 	}
 }
 
@@ -51,6 +67,7 @@ func (h *OAuthHandler) Authorize(c *gin.Context) {
 	redirectURI := c.Query("redirect_uri")
 	state := c.Query("state")
 	scope := c.Query("scope")
+	nonce := c.Query("nonce")
 	responseType := c.Query("response_type")
 	codeChallenge := c.Query("code_challenge")
 	codeChallengeMethod := c.Query("code_challenge_method")
@@ -83,7 +100,7 @@ func (h *OAuthHandler) Authorize(c *gin.Context) {
 
 	// 拿 cookie，看是否已登录
 	sid, _ := c.Cookie(CookieName)
-	user, err := h.svc.VerifyAuthSession(c.Request.Context(), sid)
+	user, authTime, err := h.svc.VerifyAuthSession(c.Request.Context(), sid)
 	if err != nil {
 		// 未登录 → 渲染登录页，保留 authorize 上下文
 		h.renderLoginPage(c, http.StatusOK, "", c.Request.URL.RawQuery)
@@ -96,6 +113,8 @@ func (h *OAuthHandler) Authorize(c *gin.Context) {
 		RedirectURI:         redirectURI,
 		Scope:               scope,
 		State:               state,
+		Nonce:               nonce,
+		AuthTime:            authTime,
 		CodeChallenge:       codeChallenge,
 		CodeChallengeMethod: codeChallengeMethod,
 		ResponseType:        responseType,
@@ -211,6 +230,145 @@ func (h *OAuthHandler) Token(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, pair)
+}
+
+// GET /oauth/userinfo —— OIDC 用户信息端点。需要 Bearer access_token。
+func (h *OAuthHandler) UserInfo(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
+	authHeader := c.GetHeader("Authorization")
+	if !strings.HasPrefix(authHeader, "Bearer ") {
+		utils.Unauthorized(c, "Bearer token required")
+		return
+	}
+	token := strings.TrimSpace(strings.TrimPrefix(authHeader, "Bearer "))
+	claims, err := h.authSvc.VerifyAccessToken(c.Request.Context(), token)
+	if err != nil {
+		utils.Unauthorized(c, "invalid or revoked token")
+		return
+	}
+	resp, err := h.svc.BuildUserInfo(c.Request.Context(), claims)
+	if err != nil {
+		utils.Internal(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, resp)
+}
+
+// GET /.well-known/openid-configuration —— OIDC discovery。
+func (h *OAuthHandler) Discovery(c *gin.Context) {
+	c.Header("Cache-Control", "public, max-age=300") // 5 min 公共缓存
+	base := h.publicBaseURL
+	if base == "" {
+		base = "http://" + c.Request.Host
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"issuer":                                base,
+		"authorization_endpoint":                base + "/oauth/authorize",
+		"token_endpoint":                        base + "/oauth/token",
+		"userinfo_endpoint":                     base + "/oauth/userinfo",
+		"jwks_uri":                              base + "/.well-known/jwks.json",
+		"revocation_endpoint":                   base + "/oauth/revoke",
+		"introspection_endpoint":                base + "/oauth/introspect",
+		"response_types_supported":              []string{"code"},
+		"grant_types_supported":                 []string{"authorization_code", "refresh_token", "client_credentials"},
+		"token_endpoint_auth_methods_supported": []string{"client_secret_basic", "client_secret_post"},
+		"code_challenge_methods_supported":      []string{"S256", "plain"},
+		"subject_types_supported":               []string{"public"},
+		"id_token_signing_alg_values_supported": []string{"RS256"},
+		"scopes_supported":                      []string{"openid", "profile", "email", "offline_access"},
+		"claims_supported":                      []string{"sub", "name", "nickname", "picture", "email", "email_verified", "tenant_id", "auth_time", "nonce"},
+	})
+}
+
+// GET /.well-known/jwks.json —— 公钥发布。业务方拿这里的公钥本地验签 JWT。
+func (h *OAuthHandler) JWKS(c *gin.Context) {
+	c.Header("Cache-Control", "public, max-age=3600") // 1 小时公共缓存
+	c.JSON(http.StatusOK, h.svc.JWKS())
+}
+
+// POST /oauth/revoke —— RFC 7009 token 撤销。
+func (h *OAuthHandler) Revoke(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
+
+	clientID, clientSecret, ok := readClientCreds(c)
+	if !ok || clientID == "" {
+		utils.BadRequest(c, "client_id required")
+		return
+	}
+	client, err := h.svc.LookupClient(c.Request.Context(), clientID)
+	if err != nil {
+		utils.Unauthorized(c, "invalid client")
+		return
+	}
+	if err := h.svc.VerifyClientSecret(client, clientSecret); err != nil {
+		utils.Unauthorized(c, "invalid client")
+		return
+	}
+
+	token := c.PostForm("token")
+	hint := c.PostForm("token_type_hint") // "access_token" | "refresh_token"
+	if token == "" {
+		// RFC 7009 §2.2: 即使 token 字段缺失也可以返 200 但提示
+		c.JSON(http.StatusOK, gin.H{})
+		return
+	}
+
+	switch hint {
+	case "refresh_token":
+		_ = h.svc.RevokeRefreshToken(c.Request.Context(), token)
+	case "access_token":
+		if h.blocklistAdd != nil {
+			_ = h.svc.RevokeAccessToken(c.Request.Context(), token, h.blocklistAdd)
+		}
+	default:
+		// 不知道类型时两个都试一下
+		if h.blocklistAdd != nil {
+			_ = h.svc.RevokeAccessToken(c.Request.Context(), token, h.blocklistAdd)
+		}
+		_ = h.svc.RevokeRefreshToken(c.Request.Context(), token)
+	}
+	// RFC 7009 §2.2: 一律返回 200（避免暴露 token 状态给攻击者）
+	c.JSON(http.StatusOK, gin.H{})
+}
+
+// POST /oauth/introspect —— RFC 7662 token 内省。
+func (h *OAuthHandler) Introspect(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
+
+	clientID, clientSecret, ok := readClientCreds(c)
+	if !ok || clientID == "" {
+		utils.BadRequest(c, "client_id required")
+		return
+	}
+	client, err := h.svc.LookupClient(c.Request.Context(), clientID)
+	if err != nil {
+		utils.Unauthorized(c, "invalid client")
+		return
+	}
+	if err := h.svc.VerifyClientSecret(client, clientSecret); err != nil {
+		utils.Unauthorized(c, "invalid client")
+		return
+	}
+
+	token := c.PostForm("token")
+	if token == "" {
+		c.JSON(http.StatusOK, gin.H{"active": false})
+		return
+	}
+	res, err := h.svc.IntrospectToken(c.Request.Context(), token, h.blocklist)
+	if err != nil {
+		utils.Internal(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, res)
+}
+
+// readClientCreds 从 Basic Auth 或 form 读出 client_id/secret。
+func readClientCreds(c *gin.Context) (string, string, bool) {
+	if u, p, ok := c.Request.BasicAuth(); ok && u != "" {
+		return u, p, true
+	}
+	return c.PostForm("client_id"), c.PostForm("client_secret"), true
 }
 
 // ----- helpers -----

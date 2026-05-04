@@ -17,12 +17,15 @@ import (
 )
 
 type Deps struct {
-	Cfg          *config.Config
-	DB           *gorm.DB
-	Cache        cache.Cache
-	AuthService  *service.AuthService
-	OAuthService *service.OAuthService
-	CookieSecure bool
+	Cfg           *config.Config
+	DB            *gorm.DB
+	Cache         cache.Cache
+	AuthService   *service.AuthService
+	OAuthService  *service.OAuthService
+	Blocklist     service.BlocklistChecker
+	BlocklistAdd  service.BlocklistAdder
+	CookieSecure  bool
+	PublicBaseURL string
 }
 
 // New 构造路由 + HTTP server。
@@ -36,15 +39,30 @@ func New(deps Deps) *http.Server {
 
 	healthH := handler.NewHealthHandler(deps.DB, deps.Cache)
 	authH := handler.NewAuthHandler(deps.AuthService)
-	oauthH := handler.NewOAuthHandler(deps.OAuthService, deps.AuthService, deps.CookieSecure)
+	oauthH := handler.NewOAuthHandler(handler.HandlerConfig{
+		Service:       deps.OAuthService,
+		AuthService:   deps.AuthService,
+		Blocklist:     deps.Blocklist,
+		BlocklistAdd:  deps.BlocklistAdd,
+		CookieSecure:  deps.CookieSecure,
+		PublicBaseURL: deps.PublicBaseURL,
+	})
 
 	// 健康检查（无需鉴权）
 	r.GET("/health", healthH.Live)
 	r.GET("/ready", healthH.Ready)
 
-	// OAuth 协议端点（V0.2）
+	// OAuth/OIDC 协议端点（V0.2.1 完整）
 	r.GET("/oauth/authorize", oauthH.Authorize)
 	r.POST("/oauth/token", oauthH.Token)
+	r.GET("/oauth/userinfo", oauthH.UserInfo)
+	r.POST("/oauth/userinfo", oauthH.UserInfo) // OIDC §5.3.1 允许 POST
+	r.POST("/oauth/revoke", oauthH.Revoke)
+	r.POST("/oauth/introspect", oauthH.Introspect)
+
+	// OIDC discovery + JWKS
+	r.GET("/.well-known/openid-configuration", oauthH.Discovery)
+	r.GET("/.well-known/jwks.json", oauthH.JWKS)
 
 	// 登录页（HTML 表单）+ OAuth 域 logout
 	r.GET("/login", oauthH.GetLogin)

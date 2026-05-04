@@ -15,10 +15,12 @@ import (
 	"gorm.io/gorm"
 )
 
-// BootstrapResult 暴露给外层用（dev 期打印 admin_web 的 client_secret 给运维抄）。
+// BootstrapResult 暴露给外层用（dev 期打印 client_secret 给运维抄）。
 type BootstrapResult struct {
-	AdminWebClientID     string
-	AdminWebClientSecret string // 仅当本次新建时返回；已有则为空
+	AdminWebClientID         string
+	AdminWebClientSecret     string // 仅当本次新建时返回；已有则为空
+	InternalSvcClientID      string
+	InternalSvcClientSecret  string // 同上
 }
 
 // EnsureBootstrap 启动时初始化数据：
@@ -186,27 +188,71 @@ func bindPlatformAdminRole(ctx context.Context, tx *gorm.DB, userID, tenantID ui
 	return err
 }
 
-// ensureDefaultOAuthClients 默认接入方：
-//   - admin_web：oneauth admin SPA 自身（dogfooding）
+// ensureDefaultOAuthClients 创建默认接入方：
+//   - admin_web：oneauth admin SPA 自身（dogfooding，confidential + auth code）
+//   - internal_service：服务间调用示例（service + client_credentials）
 //
 // 已存在则跳过；不存在则创建并把 secret 写到 res 供启动日志一次性打印。
 func ensureDefaultOAuthClients(
 	ctx context.Context, db *gorm.DB, repo *repository.OAuthClientRepo,
 	cfg *config.Config, res *BootstrapResult,
 ) error {
-	const adminClientID = "admin_web"
+	if err := ensureClient(ctx, repo, cfg, defaultClientSpec{
+		ClientID:           "admin_web",
+		Name:               "oneauth admin web",
+		Description:        "oneauth 自带的管理后台（dogfooding）",
+		ClientType:         model.ClientTypeFirstPartyConfidential,
+		RedirectURIs:       []string{"http://localhost:8080/oauth/callback/admin"},
+		GrantTypes:         []string{model.GrantTypeAuthorizationCode, model.GrantTypeRefreshToken},
+		AllowedScopes:      []string{"openid", "profile", "email", "offline_access"},
+		AllowedTenantTypes: []string{"platform"},
+		RequirePKCE:        true,
+	}, &res.AdminWebClientID, &res.AdminWebClientSecret); err != nil {
+		return err
+	}
 
-	exists, err := repo.ExistsByClientID(ctx, adminClientID)
+	if err := ensureClient(ctx, repo, cfg, defaultClientSpec{
+		ClientID:           "internal_service",
+		Name:               "internal service client",
+		Description:        "服务间调用示例（client_credentials grant）",
+		ClientType:         model.ClientTypeService,
+		RedirectURIs:       []string{},
+		GrantTypes:         []string{model.GrantTypeClientCredentials},
+		AllowedScopes:      []string{"internal.user.read", "internal.user.write"},
+		AllowedTenantTypes: []string{"platform"},
+		RequirePKCE:        false,
+	}, &res.InternalSvcClientID, &res.InternalSvcClientSecret); err != nil {
+		return err
+	}
+	return nil
+}
+
+type defaultClientSpec struct {
+	ClientID           string
+	Name               string
+	Description        string
+	ClientType         string
+	RedirectURIs       []string
+	GrantTypes         []string
+	AllowedScopes      []string
+	AllowedTenantTypes []string
+	RequirePKCE        bool
+}
+
+func ensureClient(
+	ctx context.Context, repo *repository.OAuthClientRepo, cfg *config.Config,
+	spec defaultClientSpec, idOut *string, secretOut *string,
+) error {
+	exists, err := repo.ExistsByClientID(ctx, spec.ClientID)
 	if err != nil {
-		return fmt.Errorf("check oauth_client existence: %w", err)
+		return fmt.Errorf("check oauth_client %s: %w", spec.ClientID, err)
 	}
 	if exists {
-		res.AdminWebClientID = adminClientID
+		*idOut = spec.ClientID
 		return nil
 	}
 
-	// 创建默认 admin_web client
-	rawSecret, err := utils.RandomHex(24) // 48 字符 hex secret
+	rawSecret, err := utils.RandomHex(24)
 	if err != nil {
 		return err
 	}
@@ -217,32 +263,35 @@ func ensureDefaultOAuthClients(
 
 	c := &model.OAuthClient{
 		PublicID:               utils.NewULID(),
-		ClientID:               adminClientID,
+		ClientID:               spec.ClientID,
 		ClientSecretHash:       hash,
-		Name:                   "oneauth admin web",
-		Description:            "oneauth 自带的管理后台（dogfooding）",
-		ClientType:             model.ClientTypeFirstPartyConfidential,
-		RedirectURIs:           model.JSONStrings{"http://localhost:8080/oauth/callback/admin"},
-		GrantTypes:             model.JSONStrings{model.GrantTypeAuthorizationCode, model.GrantTypeRefreshToken},
-		AllowedScopes:          model.JSONStrings{"openid", "profile", "email", "offline_access"},
-		AllowedTenantTypes:     model.JSONStrings{"platform"},
-		RequirePKCE:            true,
+		Name:                   spec.Name,
+		Description:            spec.Description,
+		ClientType:             spec.ClientType,
+		RedirectURIs:           model.JSONStrings(spec.RedirectURIs),
+		GrantTypes:             model.JSONStrings(spec.GrantTypes),
+		AllowedScopes:          model.JSONStrings(spec.AllowedScopes),
+		AllowedTenantTypes:     model.JSONStrings(spec.AllowedTenantTypes),
+		RequirePKCE:            spec.RequirePKCE,
 		AccessTokenTTLSeconds:  uint32(cfg.JWT.AccessTokenTTL.Seconds()),
 		RefreshTokenTTLSeconds: uint32(cfg.JWT.RefreshTokenTTL.Seconds()),
 		Status:                 "active",
 	}
 	if err := repo.Create(ctx, c); err != nil {
-		return fmt.Errorf("create admin_web client: %w", err)
+		return fmt.Errorf("create %s client: %w", spec.ClientID, err)
 	}
 
 	slog.Warn("=========================================================")
-	slog.Warn("bootstrap: created admin_web OAuth Client")
+	slog.Warn("bootstrap: created OAuth Client")
 	slog.Warn("client_id     = " + c.ClientID)
 	slog.Warn("client_secret = " + rawSecret + "  (SHOWN ONCE; save it now)")
-	slog.Warn("redirect_uri  = " + c.RedirectURIs[0])
+	if len(c.RedirectURIs) > 0 {
+		slog.Warn("redirect_uri  = " + c.RedirectURIs[0])
+	}
+	slog.Warn("grant_types   = " + strings.Join(c.GrantTypes, ", "))
 	slog.Warn("=========================================================")
 
-	res.AdminWebClientID = c.ClientID
-	res.AdminWebClientSecret = rawSecret
+	*idOut = c.ClientID
+	*secretOut = rawSecret
 	return nil
 }

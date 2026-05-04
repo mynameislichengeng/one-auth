@@ -72,12 +72,14 @@ func NewAuthService(
 // TokenPair 是颁发给 client 的一对 token。
 type TokenPair struct {
 	AccessToken      string    `json:"access_token"`
-	TokenType        string    `json:"token_type"` // "Bearer"
-	ExpiresIn        int64     `json:"expires_in"` // seconds
-	RefreshToken     string    `json:"refresh_token"`
-	RefreshExpiresAt time.Time `json:"refresh_expires_at"`
-	UserPublicID     string    `json:"user_id"`
-	TenantCode       string    `json:"tenant"`
+	TokenType        string    `json:"token_type"`           // "Bearer"
+	ExpiresIn        int64     `json:"expires_in"`           // seconds
+	RefreshToken     string    `json:"refresh_token,omitempty"`
+	RefreshExpiresAt time.Time `json:"refresh_expires_at,omitempty"`
+	IDToken          string    `json:"id_token,omitempty"`   // OIDC（scope 含 openid 时）
+	Scope            string    `json:"scope,omitempty"`
+	UserPublicID     string    `json:"user_id,omitempty"`
+	TenantCode       string    `json:"tenant,omitempty"`
 	Nickname         string    `json:"nickname,omitempty"`
 }
 

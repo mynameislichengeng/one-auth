@@ -399,6 +399,225 @@ else
   rm -f "$COOKIES"
 fi
 
+# ---- OIDC + 协议端点（V0.2.1 新增） ----
+
+step "Step 10: OIDC discovery + JWKS"
+status=$(req GET /.well-known/openid-configuration)
+body=$(cat /tmp/oneauth_e2e_body.json)
+if [ "$status" = "200" ]; then
+  ok "/.well-known/openid-configuration 200"
+  for field in issuer authorization_endpoint token_endpoint userinfo_endpoint jwks_uri revocation_endpoint introspection_endpoint; do
+    if echo "$body" | python3 -c "import sys,json;sys.exit(0 if json.load(sys.stdin).get('$field') else 1)"; then
+      ok "  has '$field'"
+    else
+      fail "  missing '$field'"
+    fi
+  done
+else
+  fail "/.well-known/openid-configuration $status"
+fi
+
+status=$(req GET /.well-known/jwks.json)
+body=$(cat /tmp/oneauth_e2e_body.json)
+if [ "$status" = "200" ]; then
+  ok "/.well-known/jwks.json 200"
+  if echo "$body" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+keys = d.get('keys', [])
+if not keys: sys.exit(1)
+k = keys[0]
+need = ['kty', 'kid', 'use', 'alg', 'n', 'e']
+sys.exit(0 if all(f in k for f in need) else 1)
+"; then
+    ok "  JWKS has well-formed RSA key (kty/kid/use/alg/n/e)"
+  else
+    fail "  JWKS key missing fields: $body"
+  fi
+else
+  fail "/.well-known/jwks.json $status"
+fi
+
+# ---- id_token 颁发（OIDC scope=openid） ----
+
+step "Step 11: id_token + /oauth/userinfo"
+if [ -n "$CLIENT_SECRET" ]; then
+  CODE_VERIFIER=$(openssl rand -base64 64 | tr -d "=+/\n" | cut -c1-43)
+  CODE_CHALLENGE=$(printf "%s" "$CODE_VERIFIER" | openssl dgst -sha256 -binary | openssl base64 -A | tr -d "=" | tr "/+" "_-")
+  COOKIES=$(mktemp)
+  curl -sS -c "$COOKIES" -o /dev/null -X POST "${BASE_URL}/login" \
+    -d "email=$ADMIN_EMAIL" -d "password=$ADMIN_PASSWORD" -d "return_to="
+
+  # scope=openid+profile+email + nonce
+  NONCE="nonce_$(date +%s)"
+  AUTHZ_URL="${BASE_URL}/oauth/authorize?client_id=admin_web&redirect_uri=${REDIRECT_URI_ENC}&response_type=code&state=oidc_test&scope=openid+profile+email&nonce=${NONCE}&code_challenge=${CODE_CHALLENGE}&code_challenge_method=S256"
+  LOC=$(curl -sS -b "$COOKIES" -o /dev/null -w "%{redirect_url}" "$AUTHZ_URL")
+  CODE=$(echo "$LOC" | sed -E 's/.*[?&]code=([^&]+).*/\1/')
+
+  RESP=$(curl -sS -X POST "${BASE_URL}/oauth/token" \
+    -d "grant_type=authorization_code" -d "code=$CODE" \
+    -d "redirect_uri=$REDIRECT_URI" -d "client_id=admin_web" \
+    -d "client_secret=$CLIENT_SECRET" -d "code_verifier=$CODE_VERIFIER")
+  ID_TOKEN=$(echo "$RESP" | python3 -c "import sys,json;print(json.load(sys.stdin).get('id_token',''))" 2>/dev/null)
+  ACCESS=$(echo "$RESP" | python3 -c "import sys,json;print(json.load(sys.stdin).get('access_token',''))" 2>/dev/null)
+  if [ -n "$ID_TOKEN" ]; then
+    ok "id_token returned (scope=openid)"
+    # 解码 id_token payload 看 nonce
+    PAYLOAD=$(echo "$ID_TOKEN" | cut -d. -f2 | tr "_-" "/+")
+    # 补 padding
+    case $((${#PAYLOAD} % 4)) in 2) PAYLOAD="${PAYLOAD}==" ;; 3) PAYLOAD="${PAYLOAD}=" ;; esac
+    DECODED=$(echo "$PAYLOAD" | base64 -d 2>/dev/null || echo "{}")
+    if echo "$DECODED" | python3 -c "import sys,json;d=json.load(sys.stdin);sys.exit(0 if d.get('nonce')=='$NONCE' else 1)" 2>/dev/null; then
+      ok "id_token preserves nonce"
+    else
+      fail "id_token nonce mismatch: $DECODED"
+    fi
+    if echo "$DECODED" | python3 -c "import sys,json;d=json.load(sys.stdin);sys.exit(0 if d.get('email') else 1)" 2>/dev/null; then
+      ok "id_token includes email (scope=email)"
+    else
+      fail "id_token missing email"
+    fi
+  else
+    fail "id_token missing in response: $RESP"
+  fi
+
+  # /oauth/userinfo
+  status=$(req GET /oauth/userinfo "" "$ACCESS")
+  body=$(cat /tmp/oneauth_e2e_body.json)
+  if [ "$status" = "200" ]; then
+    sub=$(json_field "$body" sub)
+    if [ -n "$sub" ]; then
+      ok "/oauth/userinfo returns sub (ULID): $sub"
+    else
+      fail "/oauth/userinfo missing sub"
+    fi
+  else
+    fail "/oauth/userinfo $status: $body"
+  fi
+
+  # /oauth/userinfo without token
+  status=$(req GET /oauth/userinfo)
+  if [ "$status" = "401" ]; then
+    ok "/oauth/userinfo without token rejected (401)"
+  else
+    fail "/oauth/userinfo without token expected 401, got $status"
+  fi
+
+  rm -f "$COOKIES"
+fi
+
+# ---- introspect / revoke ----
+
+step "Step 12: /oauth/introspect"
+if [ -n "$CLIENT_SECRET" ] && [ -n "$ACCESS" ]; then
+  RESP=$(curl -sS -X POST "${BASE_URL}/oauth/introspect" \
+    -d "token=$ACCESS" -d "client_id=admin_web" -d "client_secret=$CLIENT_SECRET")
+  active=$(json_field "$RESP" active)
+  if [ "$active" = "True" ]; then
+    ok "introspect: active=true for valid token"
+  else
+    fail "introspect: expected active=true, got: $RESP"
+  fi
+  # 错误 client_secret
+  status=$(curl -sS -o /dev/null -w "%{http_code}" -X POST "${BASE_URL}/oauth/introspect" \
+    -d "token=$ACCESS" -d "client_id=admin_web" -d "client_secret=WRONG")
+  if [ "$status" = "401" ]; then
+    ok "introspect with wrong secret rejected (401)"
+  else
+    fail "introspect wrong secret expected 401, got $status"
+  fi
+fi
+
+step "Step 13: /oauth/revoke"
+if [ -n "$CLIENT_SECRET" ] && [ -n "$ACCESS" ]; then
+  status=$(curl -sS -o /dev/null -w "%{http_code}" -X POST "${BASE_URL}/oauth/revoke" \
+    -d "token=$ACCESS" -d "token_type_hint=access_token" \
+    -d "client_id=admin_web" -d "client_secret=$CLIENT_SECRET")
+  if [ "$status" = "200" ]; then
+    ok "revoke 200 (RFC 7009)"
+  else
+    fail "revoke expected 200, got $status"
+  fi
+  # 用已撤销的 token 调 /api/me
+  status=$(req GET /api/me "" "$ACCESS")
+  if [ "$status" = "401" ]; then
+    ok "revoked access_token rejected by /api/me"
+  else
+    fail "revoked token expected 401, got $status"
+  fi
+  # introspect 也应该 active=false
+  RESP=$(curl -sS -X POST "${BASE_URL}/oauth/introspect" \
+    -d "token=$ACCESS" -d "client_id=admin_web" -d "client_secret=$CLIENT_SECRET")
+  active=$(json_field "$RESP" active)
+  if [ "$active" = "False" ]; then
+    ok "introspect: active=false for revoked token"
+  else
+    fail "introspect after revoke: $RESP"
+  fi
+fi
+
+# ---- client_credentials grant ----
+
+step "Step 14: grant_type=client_credentials (service token)"
+SVC_SECRET=$(docker compose -f deploy/docker-compose/docker-compose.yml logs oneauth 2>/dev/null \
+  | grep -A 1 "client_id     = internal_service" | grep "client_secret" | sed -E 's/.*client_secret = ([^ ]+).*/\1/' | head -1)
+if [ -z "$SVC_SECRET" ]; then
+  fail "could not read internal_service secret from logs"
+else
+  ok "found internal_service client_secret"
+  RESP=$(curl -sS -X POST "${BASE_URL}/oauth/token" \
+    -d "grant_type=client_credentials" \
+    -d "client_id=internal_service" -d "client_secret=$SVC_SECRET" \
+    -d "scope=internal.user.read")
+  SVC_TOKEN=$(json_field "$RESP" access_token)
+  if [ -n "$SVC_TOKEN" ]; then
+    ok "service token issued"
+  else
+    fail "service token failed: $RESP"
+  fi
+
+  # service token 的 sub 应该是 client_id（不是 user public_id）
+  PAYLOAD=$(echo "$SVC_TOKEN" | cut -d. -f2 | tr "_-" "/+")
+  case $((${#PAYLOAD} % 4)) in 2) PAYLOAD="${PAYLOAD}==" ;; 3) PAYLOAD="${PAYLOAD}=" ;; esac
+  DECODED=$(echo "$PAYLOAD" | base64 -d 2>/dev/null || echo "{}")
+  sub=$(echo "$DECODED" | python3 -c "import sys,json;print(json.load(sys.stdin).get('sub',''))" 2>/dev/null)
+  if [ "$sub" = "internal_service" ]; then
+    ok "service token sub=client_id (internal_service)"
+  else
+    fail "service token sub mismatch: $sub"
+  fi
+
+  # 应该不返回 refresh_token
+  rt=$(json_field "$RESP" refresh_token)
+  if [ -z "$rt" ]; then
+    ok "service token does not include refresh_token (correct)"
+  else
+    fail "service token should not have refresh_token"
+  fi
+
+  # 越权 scope
+  status=$(curl -sS -o /dev/null -w "%{http_code}" -X POST "${BASE_URL}/oauth/token" \
+    -d "grant_type=client_credentials" \
+    -d "client_id=internal_service" -d "client_secret=$SVC_SECRET" \
+    -d "scope=user:write")
+  if [ "$status" = "400" ]; then
+    ok "service token rejects out-of-allowed scope"
+  else
+    fail "out-of-allowed scope expected 400, got $status"
+  fi
+
+  # admin_web 不允许 client_credentials
+  status=$(curl -sS -o /dev/null -w "%{http_code}" -X POST "${BASE_URL}/oauth/token" \
+    -d "grant_type=client_credentials" \
+    -d "client_id=admin_web" -d "client_secret=$CLIENT_SECRET" \
+    -d "scope=internal.user.read")
+  if [ "$status" = "401" ]; then
+    ok "admin_web client cannot use client_credentials grant"
+  else
+    fail "admin_web client_credentials expected 401, got $status"
+  fi
+fi
+
 # ---- 防爆破限流（V0.1.1 新增） ----
 
 step "Step 9: 防爆破限流（同账号多次失败 → 锁定）"
