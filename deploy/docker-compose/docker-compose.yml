@@ -1,0 +1,112 @@
+# oneauth Stage 1 V0.1 — 基础登录系统
+# 使用：在本目录复制 .env.example → .env，然后 docker compose up
+#
+# 服务清单：
+#   mysql        : MySQL 8 数据库
+#   redis        : Redis 7 缓存（CACHE_DRIVER=memory 时仍启动但不连）
+#   migrate      : 一次性服务，跑 schema migration
+#   oneauth      : Go 后端服务
+
+name: oneauth-v0_1
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: oneauth_mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root_dev_pwd}
+      MYSQL_DATABASE: ${DB_NAME:-oneauth}
+      MYSQL_USER: ${DB_USERNAME:-oneauth}
+      MYSQL_PASSWORD: ${DB_PASSWORD}
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --default-authentication-plugin=caching_sha2_password
+    volumes:
+      - mysql_data:/var/lib/mysql
+    ports:
+      - "${MYSQL_HOST_PORT:-3306}:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-p${MYSQL_ROOT_PASSWORD:-root_dev_pwd}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 30s
+
+  redis:
+    image: redis:7-alpine
+    container_name: oneauth_redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    ports:
+      - "${REDIS_HOST_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  migrate:
+    image: migrate/migrate:v4.17.1
+    container_name: oneauth_migrate
+    depends_on:
+      mysql:
+        condition: service_healthy
+    volumes:
+      - ../migrations:/migrations:ro
+    command:
+      - "-path=/migrations"
+      - "-database=mysql://${DB_USERNAME:-oneauth}:${DB_PASSWORD}@tcp(mysql:3306)/${DB_NAME:-oneauth}?multiStatements=true"
+      - "up"
+    restart: "no"
+
+  oneauth:
+    build:
+      context: ../../server
+      dockerfile: Dockerfile
+    container_name: oneauth_server
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      # 数据库
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_NAME: ${DB_NAME:-oneauth}
+      DB_USERNAME: ${DB_USERNAME:-oneauth}
+      DB_PASSWORD: ${DB_PASSWORD}
+      # 缓存
+      CACHE_DRIVER: ${CACHE_DRIVER:-redis}
+      REDIS_ADDR: redis:6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      # JWT
+      JWT_PRIVATE_KEY_PATH: /app/keys/jwt-private.pem
+      JWT_PUBLIC_KEY_PATH:  /app/keys/jwt-public.pem
+      JWT_ISSUER: oneauth-dev
+      # Server
+      SERVER_LISTEN: ":8080"
+      # Bootstrap admin
+      BOOTSTRAP_ENABLED: "true"
+      BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:-admin@oneauth.local}
+      BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD}
+      BOOTSTRAP_ADMIN_NICKNAME: ${BOOTSTRAP_ADMIN_NICKNAME:-Platform Admin}
+      # Log
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      LOG_FORMAT: ${LOG_FORMAT:-text}
+    volumes:
+      - oneauth_keys:/app/keys
+    ports:
+      - "${ONEAUTH_HOST_PORT:-8080}:8080"
+    restart: unless-stopped
+
+volumes:
+  mysql_data:
+  redis_data:
+  oneauth_keys:

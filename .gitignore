@@ -3,3 +3,24 @@
 .dolt/
 *.db
 .beads-credential-key
+
+# Local working notes (not for sharing)
+lc_todo/
+
+# Go build artifacts
+server/bin/
+server/oneauth-server
+
+# Secrets and keys
+.env
+*.pem
+server/keys/
+!server/keys/.gitkeep
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store

@@ -1,0 +1,60 @@
+# oneauth server 默认配置
+# Secret 类配置必须通过环境变量注入（DB_PASSWORD / REDIS_PASSWORD / BOOTSTRAP_ADMIN_PASSWORD 等）
+# 业务规则参数写在这里
+
+server:
+  listen: ${SERVER_LISTEN:-:8080}
+  read_timeout: 10s
+  write_timeout: 30s
+  shutdown_timeout: 30s
+
+database:
+  host:     ${DB_HOST:-localhost}
+  port:     ${DB_PORT:-3306}
+  name:     ${DB_NAME:-oneauth}
+  username: ${DB_USERNAME:-oneauth}
+  password: ${DB_PASSWORD}
+  max_open_conns: 50
+  max_idle_conns: 10
+  conn_max_lifetime: 1h
+
+cache:
+  driver: ${CACHE_DRIVER:-memory}    # memory | redis
+  memory:
+    default_ttl: 5m
+    cleanup_interval: 10m
+  redis:
+    addr:     ${REDIS_ADDR:-localhost:6379}
+    password: ${REDIS_PASSWORD:-}
+    db:       0
+
+jwt:
+  algorithm:           RS256
+  private_key_path:    ${JWT_PRIVATE_KEY_PATH:-./keys/jwt-private.pem}
+  public_key_path:     ${JWT_PUBLIC_KEY_PATH:-./keys/jwt-public.pem}
+  issuer:              ${JWT_ISSUER:-oneauth}
+  access_token_ttl:    2h
+  refresh_token_ttl:   720h    # 30 天
+  auth_session_ttl:    24h     # SSO cookie session
+
+password:
+  min_length:         8
+  bcrypt_cost:        12
+
+ratelimit:
+  # 防爆破：同账号 15 分钟内失败次数上限
+  login_account_window:        15m
+  login_account_max_failures:  5
+  # IP 限流：同 IP 1 小时内失败次数上限（防撞库）
+  login_ip_window:             1h
+  login_ip_max_failures:       100
+
+bootstrap:
+  enabled:            ${BOOTSTRAP_ENABLED:-true}
+  admin_email:        ${BOOTSTRAP_ADMIN_EMAIL:-admin@oneauth.local}
+  admin_password:     ${BOOTSTRAP_ADMIN_PASSWORD}
+  admin_nickname:     ${BOOTSTRAP_ADMIN_NICKNAME:-Platform Admin}
+
+log:
+  level: ${LOG_LEVEL:-info}    # debug | info | warn | error
+  format: ${LOG_FORMAT:-text}  # text | json
