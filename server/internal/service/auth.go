@@ -345,7 +345,7 @@ func (s *AuthService) Refresh(ctx context.Context, refreshToken, ip, ua string) 
 		}
 
 		access, _, err := s.signer.SignAccessToken(
-			user.PublicID, tenant.Code, old.ClientID, newSession.ID,
+			user.PublicID, tenant.Code, old.ClientID, newSession.FamilyID,
 			[]string{}, s.cfg.JWT.AccessTokenTTL,
 		)
 		if err != nil {
@@ -396,9 +396,9 @@ func (s *AuthService) Logout(ctx context.Context, claims *utils.Claims) error {
 		return fmt.Errorf("blocklist add: %w", err)
 	}
 
-	// 撤销对应 session
-	if claims.SessionID > 0 {
-		_ = s.sessions.Revoke(ctx, claims.SessionID)
+	// 撤销对应 session（family_id 维度——撤整条 rotation chain）
+	if claims.SessionID != "" {
+		_ = s.sessions.RevokeFamily(ctx, claims.SessionID)
 	}
 	return nil
 }
@@ -433,7 +433,7 @@ func (s *AuthService) issueTokens(
 	}
 
 	accessToken, _, err := s.signer.SignAccessToken(
-		user.PublicID, tenant.Code, clientID, session.ID,
+		user.PublicID, tenant.Code, clientID, session.FamilyID,
 		[]string{}, s.cfg.JWT.AccessTokenTTL,
 	)
 	if err != nil {

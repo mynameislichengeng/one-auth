@@ -386,7 +386,7 @@ func (s *OAuthService) exchangeRefreshToken(
 
 		ttl := time.Duration(client.AccessTokenTTLSeconds) * time.Second
 		access, _, err := s.signer.SignAccessToken(
-			user.PublicID, tenant.Code, client.ClientID, newSession.ID,
+			user.PublicID, tenant.Code, client.ClientID, newSession.FamilyID,
 			[]string{}, ttl,
 		)
 		if err != nil {
@@ -445,7 +445,7 @@ func (s *OAuthService) issueTokensForClient(ctx context.Context, in issueTokensI
 
 	ttl := time.Duration(in.Client.AccessTokenTTLSeconds) * time.Second
 	access, _, err := s.signer.SignAccessTokenWithScope(
-		in.User.PublicID, in.Tenant.Code, in.Client.ClientID, session.ID,
+		in.User.PublicID, in.Tenant.Code, in.Client.ClientID, session.FamilyID,
 		[]string{}, in.Scope, ttl,
 	)
 	if err != nil {
@@ -725,9 +725,9 @@ func (s *OAuthService) IssueClientCredentialsToken(ctx context.Context,
 	}
 
 	ttl := time.Duration(client.AccessTokenTTLSeconds) * time.Second
-	// service token 的 sub 是 client_id（不是 user！）
+	// service token 的 sub 是 client_id（不是 user！），无 session 关联，sid 留空
 	access, _, err := s.signer.SignAccessTokenWithScope(
-		client.ClientID, "", client.ClientID, 0,
+		client.ClientID, "", client.ClientID, "",
 		scopes, strings.Join(scopes, " "), ttl,
 	)
 	if err != nil {

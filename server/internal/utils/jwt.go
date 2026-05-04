@@ -55,10 +55,17 @@ func (s *JWTSigner) Issuer() string { return s.issuer }
 func (s *JWTSigner) Algorithm() string { return s.algorithm }
 
 // Claims 是 oneauth access_token 的 JWT payload 结构。
+//
+// SessionID 是 user_session.family_id（CHAR(26) ULID），不是 user_session.id。
+// 用 family_id 的好处：
+//  1. 满足 D-A2 边界规则——BIGINT 不出口
+//  2. 跨 refresh rotation 稳定——同一 rotation chain 共享同一 sid
+//  3. logout 时撤整条链（RevokeFamily），语义比撤单行更对
+// service token（client_credentials）没有 session 关联，SessionID 留空字符串。
 type Claims struct {
 	TenantID    string   `json:"tenant_id,omitempty"`
 	ClientID    string   `json:"client_id,omitempty"`
-	SessionID   uint64   `json:"sid,omitempty"`
+	SessionID   string   `json:"sid,omitempty"`
 	Permissions []string `json:"permissions,omitempty"`
 	Scope       string   `json:"scope,omitempty"`
 	TokenUse    string   `json:"token_use,omitempty"` // "access" | "id"
@@ -96,13 +103,14 @@ type IDTokenInput struct {
 
 // SignAccessToken 颁发 access_token。
 // sub 应该传 user.public_id (ULID 字符串)。
-func (s *JWTSigner) SignAccessToken(sub, tenantID, clientID string, sessionID uint64,
+// sessionID 应该传 user_session.family_id (ULID 字符串)；service token 传空串。
+func (s *JWTSigner) SignAccessToken(sub, tenantID, clientID, sessionID string,
 	permissions []string, ttl time.Duration) (token string, jti string, err error) {
 	return s.SignAccessTokenWithScope(sub, tenantID, clientID, sessionID, permissions, "", ttl)
 }
 
 // SignAccessTokenWithScope 颁发 access_token，带 scope 字段。
-func (s *JWTSigner) SignAccessTokenWithScope(sub, tenantID, clientID string, sessionID uint64,
+func (s *JWTSigner) SignAccessTokenWithScope(sub, tenantID, clientID, sessionID string,
 	permissions []string, scope string, ttl time.Duration) (token string, jti string, err error) {
 
 	jti = NewULID()

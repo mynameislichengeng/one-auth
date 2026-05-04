@@ -26,7 +26,7 @@ func TestJWTSigner_SignAndVerify(t *testing.T) {
 		t.Fatalf("public key not created: %v", err)
 	}
 
-	tok, jti, err := signer.SignAccessToken("01HKQXSUB", "main", "admin_web", 42,
+	tok, jti, err := signer.SignAccessToken("01HKQXSUB", "main", "admin_web", "01HKQXSESSION0FAMILY00ULID",
 		[]string{"user:read"}, time.Hour)
 	if err != nil {
 		t.Fatalf("Sign: %v", err)
@@ -48,8 +48,8 @@ func TestJWTSigner_SignAndVerify(t *testing.T) {
 	if claims.TenantID != "main" {
 		t.Errorf("TenantID mismatch: %s", claims.TenantID)
 	}
-	if claims.SessionID != 42 {
-		t.Errorf("SessionID mismatch: %d", claims.SessionID)
+	if claims.SessionID != "01HKQXSESSION0FAMILY00ULID" {
+		t.Errorf("SessionID mismatch: %s", claims.SessionID)
 	}
 	if claims.ID != jti {
 		t.Errorf("jti mismatch: %s vs %s", claims.ID, jti)
@@ -69,7 +69,7 @@ func TestJWTSigner_VerifyTamperedTokenFails(t *testing.T) {
 		t.Fatalf("NewJWTSigner: %v", err)
 	}
 
-	tok, _, err := signer.SignAccessToken("sub1", "main", "client", 1, nil, time.Hour)
+	tok, _, err := signer.SignAccessToken("sub1", "main", "client", "fam-1", nil, time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,7 +96,7 @@ func TestJWTSigner_VerifyExpiredFails(t *testing.T) {
 		filepath.Join(dir, "pub.pem"),
 		"oneauth-test", "RS256")
 
-	tok, _, _ := signer.SignAccessToken("sub", "main", "c", 1, nil, -time.Hour)
+	tok, _, _ := signer.SignAccessToken("sub", "main", "c", "fam-1", nil, -time.Hour)
 
 	if _, err := signer.Verify(tok); err == nil {
 		t.Fatal("expired token should fail verification")
