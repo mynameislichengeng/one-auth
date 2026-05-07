@@ -1,25 +1,28 @@
 # oneauth server —— local 业务参数
 # 加载：APP_ENV=local 时由 main.go 自动选取此文件
-# 格式说明：${VAR} 占位由 main.go 启动时从环境变量替换；${VAR:-default} 提供默认值
+#
+# 占位符使用原则：${VAR} 只用于 (1) secret (2) 部署元信息（每个实例不同）
+# 产品/环境固定决策直接 hardcode，不绕一层 env 注入。
 
 # 当前运行环境标识；启动时跟 APP_ENV 环境变量自检一致性
 env: ${APP_ENV:-local}
 
 server:
-  listen: ${SERVER_LISTEN:-:8080}
+  listen: ":8080"
   read_timeout: 10s
   write_timeout: 30s
   shutdown_timeout: 30s
   # dev 期 HTTP 必须 false，浏览器才接受 cookie
-  cookie_secure: ${COOKIE_SECURE:-false}
+  cookie_secure: false
   # OIDC discovery 用的对外 base URL；留空则从请求 Host 头推断
   public_base_url: ${PUBLIC_BASE_URL:-}
 
 database:
+  # local 默认 localhost 让 IDE 直跑也能连；docker-compose 注入 DB_HOST=mysql 覆盖
   host:     ${DB_HOST:-localhost}
-  port:     ${DB_PORT:-3306}
-  name:     ${DB_NAME:-oneauth}
-  username: ${DB_USERNAME:-oneauth}
+  port:     3306
+  name:     oneauth
+  username: oneauth
   password: ${DB_PASSWORD}
   # local 默认连接池小一点
   max_open_conns: 20
@@ -27,20 +30,21 @@ database:
   conn_max_lifetime: 1h
 
 cache:
-  driver: ${CACHE_DRIVER:-memory}    # memory | redis
+  driver: redis    # local 默认 redis（dev 期跟 prod 行为一致；想 memory 直接改这里）
   memory:
     default_ttl: 5m
     cleanup_interval: 10m
   redis:
+    # local 默认 localhost；docker-compose 注入 REDIS_ADDR=redis:6379 覆盖
     addr:     ${REDIS_ADDR:-localhost:6379}
     password: ${REDIS_PASSWORD:-}
     db:       0
 
 jwt:
   algorithm:           RS256
-  private_key_path:    ${JWT_PRIVATE_KEY_PATH:-./keys/jwt-private.pem}
-  public_key_path:     ${JWT_PUBLIC_KEY_PATH:-./keys/jwt-public.pem}
-  issuer:              ${JWT_ISSUER:-oneauth-dev}
+  private_key_path:    /app/keys/jwt-private.pem
+  public_key_path:     /app/keys/jwt-public.pem
+  issuer:              oneauth-dev
   access_token_ttl:    2h
   refresh_token_ttl:   720h    # 30 天
   auth_session_ttl:    24h     # SSO cookie session
@@ -58,15 +62,16 @@ ratelimit:
   login_ip_max_failures:       1000
 
 migration:
-  enabled:            ${MIGRATION_ENABLED:-true}
+  enabled: true
 
 bootstrap:
-  enabled:            ${BOOTSTRAP_ENABLED:-true}
+  enabled:            true
+  # admin 账号：邮箱 + 密码暂留占位符，下一轮讨论是否也 hardcode
   admin_email:        ${BOOTSTRAP_ADMIN_EMAIL:-admin@oneauth.local}
   admin_password:     ${BOOTSTRAP_ADMIN_PASSWORD}
-  admin_nickname:     ${BOOTSTRAP_ADMIN_NICKNAME:-Platform Admin}
+  admin_nickname:     "Platform Admin"
 
 log:
   # local：debug + text 方便排障
-  level:  ${LOG_LEVEL:-debug}
-  format: ${LOG_FORMAT:-text}
+  level:  debug
+  format: text

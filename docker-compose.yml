@@ -28,37 +28,24 @@ x-oneauth: &oneauth-base
     context: ./server
     dockerfile: ../Dockerfile-server
   environment:
+    # 注入原则：只放 (1) secret (2) 部署元信息（每个实例不同）(3) 运行模式分支
+    # 产品/环境固定决策都在 config.{env}.yaml hardcode，不绕 env 注入
+    #
     # 运行环境标识：决定 main.go 加载 config/config.${APP_ENV}.yaml
     # 启动时跟 yaml 顶部 env 字段自检一致性
     APP_ENV: ${APP_ENV:-local}
-    # 数据库
+    # 数据库（host: local 注入 mysql 覆盖 yaml 默认 localhost；prod 必填 RDS endpoint）
     DB_HOST: ${DB_HOST:-mysql}
-    DB_PORT: ${DB_PORT:-3306}
-    DB_NAME: ${DB_NAME:-oneauth}
-    DB_USERNAME: ${DB_USERNAME:-oneauth}
     DB_PASSWORD: ${DB_PASSWORD}
-    # 缓存
-    CACHE_DRIVER: ${CACHE_DRIVER:-redis}
+    # Redis（addr: 同 DB_HOST 逻辑）
     REDIS_ADDR: ${REDIS_ADDR:-redis:6379}
     REDIS_PASSWORD: ${REDIS_PASSWORD:-}
-    # JWT
-    JWT_PRIVATE_KEY_PATH: /app/keys/jwt-private.pem
-    JWT_PUBLIC_KEY_PATH: /app/keys/jwt-public.pem
+    # 部署元信息：每个公司部署值不同
     JWT_ISSUER: ${JWT_ISSUER:-oneauth-dev}
     PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
-    # Server
-    SERVER_LISTEN: ":8080"
-    COOKIE_SECURE: ${COOKIE_SECURE:-false}
-    # 自动 SQL 迁移（启动时跑 server/sql/update/，已用 GET_LOCK 互斥保护并发启动）
-    MIGRATION_ENABLED: ${MIGRATION_ENABLED:-true}
-    # Bootstrap（已做幂等：ErrDuplicatedKey 视为已存在；蓝绿并发安全）
-    BOOTSTRAP_ENABLED: "true"
+    # Bootstrap admin 账号（暂保留占位符，下一轮讨论是否 hardcode）
     BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:-admin@oneauth.local}
     BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD}
-    BOOTSTRAP_ADMIN_NICKNAME: ${BOOTSTRAP_ADMIN_NICKNAME:-Platform Admin}
-    # Log（默认从 config.${APP_ENV}.yaml 读，这里 env 覆盖只用于临时排障）
-    LOG_LEVEL: ${LOG_LEVEL:-}
-    LOG_FORMAT: ${LOG_FORMAT:-}
     # 槽位标识（注入到日志，便于运维排查当前请求落在哪个槽）
     DEPLOY_SLOT: ${DEPLOY_SLOT:-}
   volumes:
