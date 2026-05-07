@@ -78,7 +78,8 @@ fi
 DATA_DIR="${DATA_DIR:-./docker/data}"
 SLOT_CONF="${DATA_DIR}/nginx/slot.conf"
 SLOT_CONF_BAK="${SLOT_CONF}.bak"
-GATEWAY_CONTAINER="oneauth-gateway"
+GATEWAY_CONTAINER="oneauth-gateway"  # docker-compose.yml services.gateway.container_name
+GATEWAY_SERVICE="gateway"            # docker-compose.yml service key（compose up 用）
 DRAIN_WAIT="${DRAIN_WAIT:-${DRAIN_WAIT_DEFAULT}}"
 MAX_WAIT=120
 
@@ -111,6 +112,15 @@ check_mount_inode() {
         echo "  ℹ ${container} 未运行，跳过 inode 校验"
         return 0
     fi
+    # macOS（OrbStack / Docker Desktop）跑容器要走 Linux VM，bind mount 跨 fs 边界
+    # （macOS APFS ←→ VM 内 Linux fs，靠 virtiofs/9p 桥接），两边 inode 编号空间不通
+    # → 这道检测在 macOS 上 100% false positive，跳过。
+    # Linux prod（同一 fs）保留检测，这是 vivi dangling mount 故障的核心防御网。
+    # 详见 /Users/licheng/lcClaw/work/devops/docker/blue-green/02-实操指南.md Part 5.3
+    if [ "$(uname -s)" = "Darwin" ]; then
+        echo "  ℹ macOS 跳过 inode 校验（跨 fs 边界，编号空间不通）"
+        return 0
+    fi
     while IFS='|' read -r src dst; do
         [ -z "${src}" ] && continue
         if [ ! -e "${src}" ]; then
@@ -136,10 +146,13 @@ check_mount_inode() {
 }
 
 ensure_mount_inode_consistent() {
+    # $1 = container_name（docker inspect/exec 用）；$2 = compose service name（compose up 用）
+    # 二者通常不同：services.gateway.container_name=oneauth-gateway → service key 是 gateway
     local container=$1
+    local service=$2
     if ! check_mount_inode "${container}"; then
-        echo "  → 自动 force-recreate ${container} 修复 dangling mount..."
-        ${DC} up -d --force-recreate "${container}"
+        echo "  → 自动 force-recreate ${container}（service=${service}）修复 dangling mount..."
+        ${DC} up -d --force-recreate "${service}"
         if ! check_mount_inode "${container}"; then
             echo "❌ force-recreate 后仍不一致，部署中止"
             exit 1
@@ -292,7 +305,7 @@ echo "[step4] slot.conf 已写入"
 _SLOT_CONF_MODIFIED=true
 
 # 防线 3：检测 gateway bind mount 是否健康，dangling 时 force-recreate
-ensure_mount_inode_consistent "${GATEWAY_CONTAINER}"
+ensure_mount_inode_consistent "${GATEWAY_CONTAINER}" "${GATEWAY_SERVICE}"
 
 echo "[step4] 启动 ${GATEWAY_CONTAINER}"
 ${DC} up -d gateway
