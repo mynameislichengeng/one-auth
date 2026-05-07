@@ -72,10 +72,12 @@ services:
     profiles: [mysql]
     restart: unless-stopped
     environment:
-      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root_dev_pwd}
-      MYSQL_DATABASE: ${DB_NAME:-oneauth}
-      MYSQL_USER: ${DB_USERNAME:-oneauth}
-      MYSQL_PASSWORD: ${DB_PASSWORD}
+      # 库名 / 用户名跟 oneauth-server config.{env}.yaml 一致（都 hardcode oneauth）
+      MYSQL_DATABASE: oneauth
+      MYSQL_USER:     oneauth
+      # secret 必填（.env.local 缺失 → mysql 启动失败，早 fail）
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_PASSWORD:      ${DB_PASSWORD}
     command:
       - --character-set-server=utf8mb4
       - --collation-server=utf8mb4_unicode_ci
