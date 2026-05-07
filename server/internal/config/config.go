@@ -13,7 +13,15 @@ import (
 // Config 是 oneauth-server 的全部配置。
 // Secret 类字段（password、密钥等）必须通过环境变量注入；
 // 业务参数（TTL、阈值等）写在 config.yaml。
+//
+// 单一入口：业务代码只通过 cfg.X 拿值，不直接 os.Getenv。
+// 详见 /Users/licheng/lcClaw/work/devops/docker/config-loading-go/README.md
 type Config struct {
+	// Env 当前运行环境（local / test / staging / prod）。
+	// 来自 yaml 顶层 env 字段（其值通常由 ${APP_ENV} 占位注入）。
+	// 启动时跟 os.Getenv("APP_ENV") 自检一致性。
+	Env string `mapstructure:"env"`
+
 	Server    ServerConfig    `mapstructure:"server"`
 	Database  DatabaseConfig  `mapstructure:"database"`
 	Cache     CacheConfig     `mapstructure:"cache"`
@@ -21,7 +29,27 @@ type Config struct {
 	Password  PasswordConfig  `mapstructure:"password"`
 	RateLimit RateLimitConfig `mapstructure:"ratelimit"`
 	Bootstrap BootstrapConfig `mapstructure:"bootstrap"`
+	Migration MigrationConfig `mapstructure:"migration"`
 	Log       LogConfig       `mapstructure:"log"`
+
+	// Meta 运行时元信息（GitCommit / 启动时刻等），不进 yaml，
+	// 由 main.go 启动时一次性注入。详见 MetaInfo。
+	Meta MetaInfo `mapstructure:"-"`
+}
+
+// MetaInfo 应用元信息（构建/部署期注入，应用本身不可改）。
+// 跟 Config 其他字段不同：不进 yaml，由 main.go 启动时塞入。
+type MetaInfo struct {
+	GitCommit string    // build 期通过 ldflags 或 env 注入
+	BuildTime string    // build 期注入
+	Hostname  string    // os.Hostname()
+	StartedAt time.Time // 启动时刻
+}
+
+type MigrationConfig struct {
+	// Enabled 自动 SQL 迁移开关。生产默认 true；
+	// dev 调试需要"先停一下别动数据库"时可关。
+	Enabled bool `mapstructure:"enabled"`
 }
 
 type RateLimitConfig struct {
@@ -36,6 +64,14 @@ type ServerConfig struct {
 	ReadTimeout     time.Duration `mapstructure:"read_timeout"`
 	WriteTimeout    time.Duration `mapstructure:"write_timeout"`
 	ShutdownTimeout time.Duration `mapstructure:"shutdown_timeout"`
+
+	// CookieSecure 是否给 SSO cookie 打 Secure 标记。
+	// dev 期 HTTP 必须 false，浏览器才接受 cookie；prod HTTPS 走 true。
+	CookieSecure bool `mapstructure:"cookie_secure"`
+
+	// PublicBaseURL OIDC discovery 用的对外 base URL。
+	// 留空时从请求 Host 头推断；prod 必须填正式域名（如 https://auth.licheng.cn）。
+	PublicBaseURL string `mapstructure:"public_base_url"`
 }
 
 type DatabaseConfig struct {
@@ -145,6 +181,9 @@ func expandEnv(s string) string {
 }
 
 func validate(c *Config) error {
+	if c.Env == "" {
+		return fmt.Errorf("env is required (set yaml top-level env, e.g. env: ${APP_ENV:-local})")
+	}
 	if c.Database.Host == "" {
 		return fmt.Errorf("database.host is required")
 	}

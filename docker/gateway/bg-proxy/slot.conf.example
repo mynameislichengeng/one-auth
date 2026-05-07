@@ -1,0 +1,12 @@
+# slot.conf 模板 —— 由 scripts/ci-deploy.sh sed 渲染到 ${DATA_DIR}/nginx/slot.conf
+#
+# 占位符（用 {{...}} 双括号，sed 友好且不与 nginx $variable 冲突）：
+#   {{API_SERVER}}  上游 oneauth 容器名：oneauth-blue / oneauth-green
+#
+# ⚠️ 渲染时 sed 用 `/^#/d` 剥离所有 # 开头的行，产物只剩 nginx 指令
+#    所以这里的注释不会进入产物 slot.conf，但占位符说明一定要写在 # 行里
+#    （否则 sed 替换占位符时会污染说明文字）
+upstream oneauth_backend {
+    server {{API_SERVER}}:8080;
+    keepalive 32;
+}

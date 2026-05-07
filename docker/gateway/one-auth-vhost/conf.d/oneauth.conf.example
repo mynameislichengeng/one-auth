@@ -1,0 +1,122 @@
+# oneauth 在宿主机外层 nginx 上的 server block 模板
+#
+# 部署步骤：
+#   1. cp 此文件到 /etc/nginx/conf.d/oneauth.conf
+#   2. 替换 ${...} 占位（域名、SSL 路径等）
+#   3. 用 certbot 自动签证书：sudo certbot --nginx -d auth.licheng.cn -d auth.admin.licheng.cn
+#      （certbot 会自动改 ssl_certificate / ssl_certificate_key 路径）
+#   4. sudo nginx -t && sudo systemctl reload nginx
+#
+# 之后 oneauth 蓝绿切换不动这里——内层 gateway 自己处理 upstream 切换。
+
+# ============ 上游：oneauth-gateway 容器（docker-compose 内层）============
+upstream oneauth_gateway {
+    # docker-compose 把 gateway:80 暴露到宿主机的 GATEWAY_HOST_PORT（默认 80）
+    # 用 127.0.0.1 而不是 :: 避免 IPv6 解析问题
+    server 127.0.0.1:80;
+    keepalive 16;
+}
+
+# ============ HTTP → HTTPS 跳转 ============
+server {
+    listen 80;
+    listen [::]:80;
+    server_name auth.licheng.cn auth.admin.licheng.cn;
+
+    # certbot ACME 验证用（http-01 challenge）
+    location /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+# ============ 业务面：auth.licheng.cn ============
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name auth.licheng.cn;
+
+    # SSL 证书（certbot 会自动填这俩，初次手填即可）
+    ssl_certificate     /etc/letsencrypt/live/auth.licheng.cn/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/auth.licheng.cn/privkey.pem;
+
+    # ssl 加固（业界推荐配置）
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+    ssl_prefer_server_ciphers on;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 1d;
+
+    # HSTS（强制 HTTPS，注意首次部署确认证书 OK 再开）
+    add_header Strict-Transport-Security "max-age=63072000; includeSubDomains" always;
+
+    # 安全头
+    add_header X-Content-Type-Options nosniff always;
+    add_header X-Frame-Options SAMEORIGIN always;
+    add_header Referrer-Policy no-referrer-when-downgrade always;
+
+    # 访问 / 错误日志
+    access_log /var/log/nginx/oneauth-access.log;
+    error_log  /var/log/nginx/oneauth-error.log warn;
+
+    # 全 location 反代到内层 gateway
+    location / {
+        proxy_pass http://oneauth_gateway;
+
+        proxy_http_version 1.1;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host  $host;
+        proxy_set_header Connection        "";
+
+        proxy_read_timeout 60s;
+        proxy_send_timeout 60s;
+    }
+
+    # （可选）速率限制：未来挡爆破登录可以在这一层加
+    # limit_req_zone $binary_remote_addr zone=oneauth_login:10m rate=10r/m;
+    # location /login { limit_req zone=oneauth_login burst=20; proxy_pass http://oneauth_gateway; }
+}
+
+# ============ 管理面：auth.admin.licheng.cn（V0.3 admin SPA 接入后启用）============
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name auth.admin.licheng.cn;
+
+    ssl_certificate     /etc/letsencrypt/live/auth.admin.licheng.cn/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/auth.admin.licheng.cn/privkey.pem;
+
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+    ssl_prefer_server_ciphers on;
+
+    add_header Strict-Transport-Security "max-age=63072000; includeSubDomains" always;
+    add_header X-Content-Type-Options nosniff always;
+    add_header X-Frame-Options DENY always;             # admin 后台禁止被 iframe
+    add_header Referrer-Policy no-referrer-when-downgrade always;
+
+    access_log /var/log/nginx/oneauth-admin-access.log;
+    error_log  /var/log/nginx/oneauth-admin-error.log warn;
+
+    # 反代到同一个内层 gateway，由 gateway 内部按 host 区分 location
+    location / {
+        proxy_pass http://oneauth_gateway;
+
+        proxy_http_version 1.1;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host  $host;
+        proxy_set_header Connection        "";
+
+        proxy_read_timeout 60s;
+        proxy_send_timeout 60s;
+    }
+}

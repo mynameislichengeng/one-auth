@@ -2,8 +2,8 @@
 # oneauth V0.1 端到端测试脚本
 #
 # 用法：
-#   1. 先启动服务：make compose-up
-#   2. 等服务 ready 后跑：make e2e   或   bash server/scripts/test_e2e.sh
+#   1. 先启动服务：./scripts/deploy-local.sh
+#   2. 等服务 ready 后跑：./scripts/docker-service-manager.sh e2e   或   bash server/scripts/test_e2e.sh
 #
 # 验证内容：
 #   - /health, /ready
@@ -81,7 +81,7 @@ for i in $(seq 1 30); do
   fi
   if [ "$i" -eq 30 ]; then
     fail "service not ready after 30s"
-    echo "  请先 make compose-up，并等待 mysql 完成 migration"
+    echo "  请先 ./scripts/docker-service-manager.sh up，并等待 mysql 完成 migration"
     exit 1
   fi
   sleep 1
@@ -266,10 +266,10 @@ step "Step 9: OAuth Authorization Code + PKCE 完整流程"
 
 # 拿 admin_web 的 client_secret —— bootstrap 时从日志读
 CLIENT_ID="admin_web"
-CLIENT_SECRET=$(docker compose -f deploy/docker-compose/docker-compose.yml logs oneauth 2>/dev/null \
+CLIENT_SECRET=$(docker compose logs oneauth 2>/dev/null \
   | grep "client_secret =" | head -1 | sed -E 's/.*client_secret = ([^ ]+).*/\1/')
 if [ -z "$CLIENT_SECRET" ]; then
-  fail "could not read admin_web client_secret from logs (try: make compose-down-clean && make compose-up)"
+  fail "could not read admin_web client_secret from logs (try: ./scripts/docker-service-manager.sh reset)"
   echo "  Skipping OAuth tests..."
 else
   ok "found admin_web client_secret in logs"
@@ -559,7 +559,7 @@ fi
 # ---- client_credentials grant ----
 
 step "Step 14: grant_type=client_credentials (service token)"
-SVC_SECRET=$(docker compose -f deploy/docker-compose/docker-compose.yml logs oneauth 2>/dev/null \
+SVC_SECRET=$(docker compose logs oneauth 2>/dev/null \
   | grep -A 1 "client_id     = internal_service" | grep "client_secret" | sed -E 's/.*client_secret = ([^ ]+).*/\1/' | head -1)
 if [ -z "$SVC_SECRET" ]; then
   fail "could not read internal_service secret from logs"
@@ -618,9 +618,9 @@ else
   fi
 fi
 
-# ---- 防爆破限流（V0.1.1 新增） ----
+# ---- 防爆破限流 ----
 
-step "Step 9: 防爆破限流（同账号多次失败 → 锁定）"
+step "Step 15: API 防爆破限流（/api/auth/login 同账号多次失败 → 锁定）"
 LOCK_EMAIL="lock_$(date +%s)@example.com"
 # 先注册一个用户
 status=$(req POST /api/auth/register \
@@ -654,6 +654,60 @@ if [ "$status" = "429" ]; then
   ok "correct password during lockout still rejected"
 else
   fail "expected 429 even with correct password during lockout, got $status"
+fi
+
+# ---- HTML 登录页防爆破（V0.2.2 新增 P0-A 修复）----
+
+step "Step 16: HTML 表单 /login 也要走防爆破（P0-A 修复验证）"
+HLOCK_EMAIL="hlock_$(date +%s)@example.com"
+# 注册新账号（API 走 register；表单 /login 不提供注册）
+status=$(req POST /api/auth/register \
+  "{\"email\":\"$HLOCK_EMAIL\",\"password\":\"CorrectPwd123\"}")
+[ "$status" = "201" ] && ok "registered $HLOCK_EMAIL" || fail "register hlock test user: $status"
+
+# 故意用 HTML 表单 POST 输错 5 次
+hlocked=0
+for i in 1 2 3 4 5; do
+  hstatus=$(curl -sS -o /dev/null -w "%{http_code}" -X POST \
+    -H "Content-Type: application/x-www-form-urlencoded" \
+    --data-urlencode "email=$HLOCK_EMAIL" \
+    --data-urlencode "password=wrong${i}" \
+    "${BASE_URL}/login")
+  # /login 失败时返回 401（render 登录页 + Unauthorized 状态）
+  if [ "$hstatus" = "401" ]; then
+    hlocked=1
+  fi
+done
+
+# 第 6 次：账号应已被锁，即使错密码继续提交也应 401（锁定窗口内 ErrTooManyAttempts → 文案提示）
+hstatus=$(curl -sS -o /tmp/oneauth_e2e_body.html -w "%{http_code}" -X POST \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  --data-urlencode "email=$HLOCK_EMAIL" \
+  --data-urlencode "password=wrong6" \
+  "${BASE_URL}/login")
+if [ "$hstatus" = "401" ]; then
+  ok "html /login 6th attempt rejected (status 401)"
+else
+  fail "expected 401 on html /login 6th attempt, got $hstatus"
+fi
+
+# 验证锁定文案出现在 HTML 响应里（"登录失败次数过多"）
+if grep -q "登录失败次数过多" /tmp/oneauth_e2e_body.html 2>/dev/null; then
+  ok "html /login shows lockout message after threshold"
+else
+  fail "expected html /login lockout message in body"
+fi
+
+# 即使密码正确，锁定窗口内也应被拒（验证防爆破覆盖 HTML 表单路径）
+hstatus=$(curl -sS -o /dev/null -w "%{http_code}" -X POST \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  --data-urlencode "email=$HLOCK_EMAIL" \
+  --data-urlencode "password=CorrectPwd123" \
+  "${BASE_URL}/login")
+if [ "$hstatus" = "401" ]; then
+  ok "html /login: correct password rejected during lockout (P0-A 防爆破覆盖 HTML 路径)"
+else
+  fail "expected html /login 401 even with correct password during lockout, got $hstatus"
 fi
 
 # ---- 总结 ----

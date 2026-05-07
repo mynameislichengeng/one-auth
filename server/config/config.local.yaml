@@ -1,12 +1,19 @@
-# oneauth server 默认配置
-# Secret 类配置必须通过环境变量注入（DB_PASSWORD / REDIS_PASSWORD / BOOTSTRAP_ADMIN_PASSWORD 等）
-# 业务规则参数写在这里
+# oneauth server —— local 业务参数
+# 加载：APP_ENV=local 时由 main.go 自动选取此文件
+# 格式说明：${VAR} 占位由 main.go 启动时从环境变量替换；${VAR:-default} 提供默认值
+
+# 当前运行环境标识；启动时跟 APP_ENV 环境变量自检一致性
+env: ${APP_ENV:-local}
 
 server:
   listen: ${SERVER_LISTEN:-:8080}
   read_timeout: 10s
   write_timeout: 30s
   shutdown_timeout: 30s
+  # dev 期 HTTP 必须 false，浏览器才接受 cookie
+  cookie_secure: ${COOKIE_SECURE:-false}
+  # OIDC discovery 用的对外 base URL；留空则从请求 Host 头推断
+  public_base_url: ${PUBLIC_BASE_URL:-}
 
 database:
   host:     ${DB_HOST:-localhost}
@@ -14,8 +21,9 @@ database:
   name:     ${DB_NAME:-oneauth}
   username: ${DB_USERNAME:-oneauth}
   password: ${DB_PASSWORD}
-  max_open_conns: 50
-  max_idle_conns: 10
+  # local 默认连接池小一点
+  max_open_conns: 20
+  max_idle_conns: 5
   conn_max_lifetime: 1h
 
 cache:
@@ -32,22 +40,25 @@ jwt:
   algorithm:           RS256
   private_key_path:    ${JWT_PRIVATE_KEY_PATH:-./keys/jwt-private.pem}
   public_key_path:     ${JWT_PUBLIC_KEY_PATH:-./keys/jwt-public.pem}
-  issuer:              ${JWT_ISSUER:-oneauth}
+  issuer:              ${JWT_ISSUER:-oneauth-dev}
   access_token_ttl:    2h
   refresh_token_ttl:   720h    # 30 天
   auth_session_ttl:    24h     # SSO cookie session
 
 password:
   min_length:         8
-  bcrypt_cost:        12
+  # local：bcrypt cost 调低加快测试（每次 login 大约几 ms）
+  bcrypt_cost:        10
 
 ratelimit:
-  # 防爆破：同账号 15 分钟内失败次数上限
+  # local 宽松，避免开发期被限流卡住
   login_account_window:        15m
-  login_account_max_failures:  5
-  # IP 限流：同 IP 1 小时内失败次数上限（防撞库）
+  login_account_max_failures:  100
   login_ip_window:             1h
-  login_ip_max_failures:       100
+  login_ip_max_failures:       1000
+
+migration:
+  enabled:            ${MIGRATION_ENABLED:-true}
 
 bootstrap:
   enabled:            ${BOOTSTRAP_ENABLED:-true}
@@ -56,5 +67,6 @@ bootstrap:
   admin_nickname:     ${BOOTSTRAP_ADMIN_NICKNAME:-Platform Admin}
 
 log:
-  level: ${LOG_LEVEL:-info}    # debug | info | warn | error
-  format: ${LOG_FORMAT:-text}  # text | json
+  # local：debug + text 方便排障
+  level:  ${LOG_LEVEL:-debug}
+  format: ${LOG_FORMAT:-text}

@@ -1,0 +1,75 @@
+# oneauth server —— prod 业务参数
+# 加载：APP_ENV=prod 时由 main.go 自动选取此文件
+#
+# 部署前必须通过 .env.prod 或 GitHub Actions secrets 注入：
+#   DB_PASSWORD / REDIS_PASSWORD / BOOTSTRAP_ADMIN_PASSWORD / JWT_ISSUER / PUBLIC_BASE_URL
+
+# 当前运行环境标识；启动时跟 APP_ENV 环境变量自检一致性
+env: ${APP_ENV:-prod}
+
+server:
+  listen: ${SERVER_LISTEN:-:8080}
+  read_timeout: 10s
+  write_timeout: 30s
+  shutdown_timeout: 30s
+  # prod HTTPS 必须 true（cookie 仅 HTTPS 发送）
+  cookie_secure: ${COOKIE_SECURE:-true}
+  # OIDC discovery 用的对外 base URL；prod 必须显式指定
+  public_base_url: ${PUBLIC_BASE_URL}
+
+database:
+  host:     ${DB_HOST}                       # prod 必填，通常是 RDS endpoint
+  port:     ${DB_PORT:-3306}
+  name:     ${DB_NAME:-oneauth}
+  username: ${DB_USERNAME:-oneauth}
+  password: ${DB_PASSWORD}
+  # prod 连接池放大
+  max_open_conns: 100
+  max_idle_conns: 20
+  conn_max_lifetime: 1h
+
+cache:
+  driver: ${CACHE_DRIVER:-redis}             # prod 默认 redis
+  memory:
+    default_ttl: 5m
+    cleanup_interval: 10m
+  redis:
+    addr:     ${REDIS_ADDR}                  # prod 必填
+    password: ${REDIS_PASSWORD}              # prod 必填
+    db:       0
+
+jwt:
+  algorithm:           RS256
+  private_key_path:    ${JWT_PRIVATE_KEY_PATH:-/app/keys/jwt-private.pem}
+  public_key_path:     ${JWT_PUBLIC_KEY_PATH:-/app/keys/jwt-public.pem}
+  issuer:              ${JWT_ISSUER}         # prod 必填，正式域名（如 https://auth.licheng.cn）
+  access_token_ttl:    2h
+  refresh_token_ttl:   720h    # 30 天
+  auth_session_ttl:    24h     # SSO cookie session
+
+password:
+  min_length:         8
+  # prod：bcrypt cost 标准 12（安全/性能平衡）
+  bcrypt_cost:        12
+
+ratelimit:
+  # prod 严格防爆破/防撞库
+  login_account_window:        15m
+  login_account_max_failures:  5
+  login_ip_window:             1h
+  login_ip_max_failures:       100
+
+migration:
+  enabled:            ${MIGRATION_ENABLED:-true}
+
+bootstrap:
+  # prod 默认仍开启 bootstrap（首次启动创建 admin 账号），但密码必填
+  enabled:            ${BOOTSTRAP_ENABLED:-true}
+  admin_email:        ${BOOTSTRAP_ADMIN_EMAIL}
+  admin_password:     ${BOOTSTRAP_ADMIN_PASSWORD}
+  admin_nickname:     ${BOOTSTRAP_ADMIN_NICKNAME:-Platform Admin}
+
+log:
+  # prod：info + json 方便日志聚合
+  level:  ${LOG_LEVEL:-info}
+  format: ${LOG_FORMAT:-json}

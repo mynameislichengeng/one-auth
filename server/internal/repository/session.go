@@ -36,20 +36,12 @@ func (r *SessionRepo) MarkRotated(ctx context.Context, id uint64) error {
 		Update("rotated_at", now).Error
 }
 
-// RevokeFamily 把整个 family 内所有 session 标记 revoked（重放检测时用）。
+// RevokeFamily 把整个 family 内所有 session 标记 revoked。
+// 用于：refresh token 重放检测、用户登出（撤整条 rotation chain）。
 func (r *SessionRepo) RevokeFamily(ctx context.Context, familyID string) error {
 	now := time.Now()
 	return r.db.WithContext(ctx).
 		Model(&model.UserSession{}).
 		Where("family_id = ? AND revoked_at IS NULL", familyID).
-		Update("revoked_at", now).Error
-}
-
-// Revoke 单条 session 撤销。
-func (r *SessionRepo) Revoke(ctx context.Context, id uint64) error {
-	now := time.Now()
-	return r.db.WithContext(ctx).
-		Model(&model.UserSession{}).
-		Where("id = ? AND revoked_at IS NULL", id).
 		Update("revoked_at", now).Error
 }

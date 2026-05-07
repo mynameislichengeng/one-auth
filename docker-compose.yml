@@ -1,0 +1,149 @@
+# oneauth 蓝绿发布开发栈
+#
+# 本地启栈（首次→部署到 blue；二次→蓝绿切换）：
+#   ./scripts/deploy-local.sh
+#
+# 辅助命令（不重新部署）：
+#   ./scripts/docker-service-manager.sh status            查看容器状态
+#   ./scripts/docker-service-manager.sh logs [oneauth-blue|oneauth-green|gateway|mysql|redis]
+#   ./scripts/docker-service-manager.sh secrets           打印 dev bootstrap 出的 client_id / secret
+#   ./scripts/docker-service-manager.sh down              停所有
+#   ./scripts/docker-service-manager.sh reset             停 + 清数据 + 重新部署
+#   ./scripts/docker-service-manager.sh e2e               跑 62 项端到端测试
+#
+# 服务清单：
+#   mysql            : MySQL 8（profile=mysql；prod 用云 RDS，不启此服务）
+#   redis            : Redis 7（profile=redis；prod 用云 Redis，不启此服务）
+#   oneauth-blue     : Go 后端 蓝槽（profile=blue，由 ci-deploy.sh 按需启停）
+#   oneauth-green    : Go 后端 绿槽（profile=green，由 ci-deploy.sh 按需启停）
+#   gateway          : Nginx 反代（永不重建，靠 reload 切流量）
+
+name: oneauth
+
+# ==================== 后端公共配置（YAML anchor） ====================
+# blue / green 共享，避免双份配置漂移
+x-oneauth: &oneauth-base
+  build:
+    # build context 在 server/，dockerfile 在仓库根（相对 context 是 ../Dockerfile-server）
+    context: ./server
+    dockerfile: ../Dockerfile-server
+  environment:
+    # 运行环境标识：决定 main.go 加载 config/config.${APP_ENV}.yaml
+    # 启动时跟 yaml 顶部 env 字段自检一致性
+    APP_ENV: ${APP_ENV:-local}
+    # 数据库
+    DB_HOST: ${DB_HOST:-mysql}
+    DB_PORT: ${DB_PORT:-3306}
+    DB_NAME: ${DB_NAME:-oneauth}
+    DB_USERNAME: ${DB_USERNAME:-oneauth}
+    DB_PASSWORD: ${DB_PASSWORD}
+    # 缓存
+    CACHE_DRIVER: ${CACHE_DRIVER:-redis}
+    REDIS_ADDR: ${REDIS_ADDR:-redis:6379}
+    REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+    # JWT
+    JWT_PRIVATE_KEY_PATH: /app/keys/jwt-private.pem
+    JWT_PUBLIC_KEY_PATH: /app/keys/jwt-public.pem
+    JWT_ISSUER: ${JWT_ISSUER:-oneauth-dev}
+    PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
+    # Server
+    SERVER_LISTEN: ":8080"
+    COOKIE_SECURE: ${COOKIE_SECURE:-false}
+    # 自动 SQL 迁移（启动时跑 server/sql/update/，已用 GET_LOCK 互斥保护并发启动）
+    MIGRATION_ENABLED: ${MIGRATION_ENABLED:-true}
+    # Bootstrap（已做幂等：ErrDuplicatedKey 视为已存在；蓝绿并发安全）
+    BOOTSTRAP_ENABLED: "true"
+    BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:-admin@oneauth.local}
+    BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD}
+    BOOTSTRAP_ADMIN_NICKNAME: ${BOOTSTRAP_ADMIN_NICKNAME:-Platform Admin}
+    # Log（默认从 config.${APP_ENV}.yaml 读，这里 env 覆盖只用于临时排障）
+    LOG_LEVEL: ${LOG_LEVEL:-}
+    LOG_FORMAT: ${LOG_FORMAT:-}
+    # 槽位标识（注入到日志，便于运维排查当前请求落在哪个槽）
+    DEPLOY_SLOT: ${DEPLOY_SLOT:-}
+  volumes:
+    # JWT 密钥目录（蓝绿共享同一份；首次启动若不存在会自动生成，后续两槽都用）
+    - ./docker/data/oneauth:/app/keys
+    # config 目录挂载：改 yaml 不用 rebuild 镜像（镜像里已 COPY 一份做兜底）
+    - ./server/config:/app/config:ro
+  # 不暴露 host port：蓝绿期间两槽端口会冲突；统一走 gateway:80
+  # 想本地直连某槽调试：docker exec -it oneauth-blue sh
+  expose:
+    - "8080"
+  restart: unless-stopped
+
+services:
+  # ==================== MySQL（仅 local；prod 用阿里云 RDS） ====================
+  # 8.4 LTS（支持到 2032-04）；8.0 active support 已于 2026-04 结束
+  mysql:
+    image: mysql:8.4
+    container_name: oneauth-mysql
+    profiles: [mysql]
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root_dev_pwd}
+      MYSQL_DATABASE: ${DB_NAME:-oneauth}
+      MYSQL_USER: ${DB_USERNAME:-oneauth}
+      MYSQL_PASSWORD: ${DB_PASSWORD}
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      # 8.4 默认就是 caching_sha2_password；--default-authentication-plugin 在 8.4 已移除（传它会 abort）
+    volumes:
+      - ./docker/data/mysql:/var/lib/mysql
+    ports:
+      - "${MYSQL_HOST_PORT:-3306}:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-p${MYSQL_ROOT_PASSWORD:-root_dev_pwd}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 30s
+
+  # ==================== Valkey（仅 local；prod 用云 Redis/Valkey） ====================
+  # Valkey 是 Redis 7.2 fork（Linux Foundation 维护，BSD 许可），客户端协议 100% 兼容 Redis。
+  # 应用代码不变（go-redis 直接连），只是镜像换名。
+  # service 名仍叫 redis：保留心智模型 + 不动 ${REDIS_ADDR:-redis:6379} 默认值。
+  redis:
+    image: valkey/valkey:8-alpine
+    container_name: oneauth-redis
+    profiles: [redis]
+    restart: unless-stopped
+    command: ["valkey-server", "--appendonly", "yes"]
+    volumes:
+      - ./docker/data/redis:/data
+    ports:
+      - "${REDIS_HOST_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ==================== 蓝绿后端（两槽并行，由 ci-deploy.sh 按 profile 启停） ====================
+  oneauth-blue:
+    <<: *oneauth-base
+    image: oneauth-server-blue
+    container_name: oneauth-blue
+    profiles: [blue]
+
+  oneauth-green:
+    <<: *oneauth-base
+    image: oneauth-server-green
+    container_name: oneauth-green
+    profiles: [green]
+
+  # ==================== Gateway（双层 nginx 的内部一层，永不重建） ====================
+  # volumes 按"谁是写者"分治（详见 /Users/licheng/lcClaw/work/devops/nginx/blue-green/）：
+  #   - 静态配置 conf/ 下的 default.conf  → 整目录 mount，git 写，git pull 即生效
+  #   - 运行时 slot.conf                  → 单文件 mount + 稳定路径，由 ci-deploy.sh sed 渲染
+  #     target 刻意挂在 conf.d/ 之外（snippets/），避免 Docker 在仓库 conf/ 内造 0 byte 占位
+  gateway:
+    image: nginx:alpine
+    container_name: oneauth-gateway
+    ports:
+      - "${GATEWAY_HOST_PORT:-80}:80"
+    volumes:
+      - ./docker/gateway/bg-proxy/conf/:/etc/nginx/conf.d/:ro
+      - ${DATA_DIR:-./docker/data}/nginx/slot.conf:/etc/nginx/snippets/slot.conf:ro
+    restart: unless-stopped

@@ -12,10 +12,21 @@ server/bin/
 server/oneauth-server
 
 # Secrets and keys
+# 规范：本项目统一用 .env.local / .env.prod / ...（详见 .env.example 顶部注释）
+# 进 git 的只有 .env.example 一份模板。
+# .env（无后缀）按规范用不到，这里仍 ignore 作为兜底——
+# 防止有人按"docker-compose 默认读 .env"的旧习惯创建文件，避免误 commit 泄漏。
 .env
+.env.*
+!.env.example
 *.pem
 server/keys/
 !server/keys/.gitkeep
+
+# Docker bind-mount 数据：本地运行时由容器写入，不进 git。
+# 保留 .gitkeep 让目录骨架进 git，否则 docker compose up 会报"路径不存在"。
+docker/data/*/*
+!docker/data/*/.gitkeep
 
 # IDE
 .vscode/

@@ -183,13 +183,16 @@ type LoginRequest struct {
 	UserAgent string
 }
 
-// Login 邮箱+密码登录。集成防爆破：
-//  1. 检查同账号失败次数（窗口内 ≥ N 次直接拒绝）
-//  2. 检查同 IP 失败次数
-//  3. 每次尝试都写 login_attempts（成功/失败都记）
-func (s *AuthService) Login(ctx context.Context, req LoginRequest) (*TokenPair, error) {
+// AuthenticatePassword 邮箱+密码身份认证（不签 token），集成防爆破：
+//   1. 检查同账号失败次数（窗口内 ≥ N 次直接拒绝）
+//   2. 检查同 IP 失败次数
+//   3. 每次尝试都写 login_attempts（成功/失败都记）
+//
+// 返回 user + main tenant；调用方决定怎么处理（API /login 签 JWT；HTML /login 种 cookie）。
+// 这是单一密码认证入口，让 API 和 HTML 表单共享一致的安全策略。
+func (s *AuthService) AuthenticatePassword(ctx context.Context, req LoginRequest) (*model.User, *model.Tenant, error) {
 	if req.Email == "" || req.Password == "" {
-		return nil, ErrInvalidCredential
+		return nil, nil, ErrInvalidCredential
 	}
 
 	now := time.Now()
@@ -199,13 +202,13 @@ func (s *AuthService) Login(ctx context.Context, req LoginRequest) (*TokenPair, 
 	if accFails, _ := s.attempts.CountFailuresByIdentifier(ctx,
 		model.AuthTypeEmail, req.Email, accWindow); accFails >= int64(s.cfg.RateLimit.LoginAccountMaxFailures) {
 		s.recordAttempt(ctx, req.Email, req.IP, req.UserAgent, false, model.LoginFailureLocked, nil)
-		return nil, ErrTooManyAttempts
+		return nil, nil, ErrTooManyAttempts
 	}
 	// 防爆破：IP 级别窗口
 	ipWindow := now.Add(-s.cfg.RateLimit.LoginIPWindow)
 	if ipFails, _ := s.attempts.CountFailuresByIP(ctx, req.IP, ipWindow); ipFails >= int64(s.cfg.RateLimit.LoginIPMaxFailures) {
 		s.recordAttempt(ctx, req.Email, req.IP, req.UserAgent, false, model.LoginFailureLocked, nil)
-		return nil, ErrTooManyAttempts
+		return nil, nil, ErrTooManyAttempts
 	}
 
 	auth, err := s.auths.FindByIdentifier(ctx, model.AuthTypeEmail, req.Email)
@@ -213,48 +216,51 @@ func (s *AuthService) Login(ctx context.Context, req LoginRequest) (*TokenPair, 
 		if repository.IsNotFound(err) {
 			s.recordAttempt(ctx, req.Email, req.IP, req.UserAgent, false, model.LoginFailureUserNotFound, nil)
 			// 不暴露"账号不存在"还是"密码错"，统一返回相同错误
-			return nil, ErrInvalidCredential
+			return nil, nil, ErrInvalidCredential
 		}
-		return nil, err
+		return nil, nil, err
 	}
 	if auth.Credential == nil || !utils.CheckPassword(req.Password, *auth.Credential) {
 		s.recordAttempt(ctx, req.Email, req.IP, req.UserAgent, false, model.LoginFailureInvalidPassword, &auth.UserID)
-		return nil, ErrInvalidCredential
+		return nil, nil, ErrInvalidCredential
 	}
 
 	user, err := s.users.FindByID(ctx, auth.UserID)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if user.Status != model.UserStatusActive {
 		s.recordAttempt(ctx, req.Email, req.IP, req.UserAgent, false, model.LoginFailureUserSuspended, &user.ID)
-		return nil, ErrUserNotActive
+		return nil, nil, ErrUserNotActive
 	}
 
 	// V0.1 简化：只用 main 租户
 	mainTenant, err := s.tenants.FindByCode(ctx, "main")
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	hasMembership, err := s.memberships.ExistsActive(ctx, user.ID, mainTenant.ID)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if !hasMembership {
 		s.recordAttempt(ctx, req.Email, req.IP, req.UserAgent, false, model.LoginFailureUserSuspended, &user.ID)
-		return nil, ErrUserNotActive
+		return nil, nil, ErrUserNotActive
 	}
 
-	// 异步更新 last_used_at（失败不影响登录）
 	_ = s.auths.MarkUsed(ctx, auth.ID)
+	s.recordAttempt(ctx, req.Email, req.IP, req.UserAgent, true, "", &user.ID)
+	return user, mainTenant, nil
+}
 
-	pair, err := s.issueTokens(ctx, s.sessions, user, mainTenant, req.IP, req.UserAgent, now)
+// Login 邮箱+密码登录，颁发 access/refresh token（API 入口 /api/auth/login 用）。
+// HTML 表单 /login 不走这条；它走 AuthenticatePassword + CreateAuthSession。
+func (s *AuthService) Login(ctx context.Context, req LoginRequest) (*TokenPair, error) {
+	user, tenant, err := s.AuthenticatePassword(ctx, req)
 	if err != nil {
 		return nil, err
 	}
-
-	s.recordAttempt(ctx, req.Email, req.IP, req.UserAgent, true, "", &user.ID)
-	return pair, nil
+	return s.issueTokens(ctx, s.sessions, user, tenant, req.IP, req.UserAgent, time.Now())
 }
 
 // recordAttempt 写一条登录尝试日志；失败不影响主链路（只记日志）。

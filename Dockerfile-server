@@ -1,0 +1,39 @@
+# oneauth-server 镜像
+# multi-stage build；不依赖外部 dockerfile syntax frontend，避免 mirror 不可用阻塞构建。
+
+# ---- Builder ----
+FROM golang:1.22-alpine AS builder
+WORKDIR /build
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+RUN CGO_ENABLED=0 GOOS=linux go build \
+    -trimpath \
+    -ldflags="-s -w" \
+    -o /out/oneauth-server ./cmd/server
+
+# ---- Runtime ----
+FROM alpine:3.20
+RUN apk add --no-cache ca-certificates tzdata wget && \
+    adduser -D -u 10001 oneauth
+
+WORKDIR /app
+COPY --from=builder /out/oneauth-server /app/oneauth-server
+# 把整个 config 目录拷进镜像作为兜底；docker-compose 通常会再 mount 覆盖（local 改 yaml 不用 rebuild）
+COPY config/ /app/config/
+
+# keys 目录运行时挂载或自动生成
+RUN mkdir -p /app/keys && chown -R oneauth:oneauth /app
+
+USER oneauth
+EXPOSE 8080
+
+# 健康检查
+HEALTHCHECK --interval=10s --timeout=3s --start-period=15s --retries=3 \
+    CMD wget -qO- http://localhost:8080/health || exit 1
+
+# 不传 -config，让 main.go 按 APP_ENV 自动选 config/config.${APP_ENV}.yaml
+ENTRYPOINT ["/app/oneauth-server"]

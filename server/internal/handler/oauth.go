@@ -137,17 +137,27 @@ func (h *OAuthHandler) GetLogin(c *gin.Context) {
 //
 // 成功：种 oneauth_sid cookie，重定向回 return_to（如果有）或 /
 // 失败：重新渲染登录页，显示错误。
+//
+// 走 AuthService.AuthenticatePassword 复用 API /login 同款防爆破策略
+// （账号 + IP 双窗口 + 登录尝试日志）。这里不能绕开。
 func (h *OAuthHandler) PostLogin(c *gin.Context) {
 	email := c.PostForm("email")
 	password := c.PostForm("password")
 	returnTo := safeReturnTo(c.PostForm("return_to")) // 防开放重定向
 
-	user, err := h.svc.AuthenticatePassword(c.Request.Context(), email, password,
-		c.ClientIP(), c.Request.UserAgent())
+	user, _, err := h.authSvc.AuthenticatePassword(c.Request.Context(), service.LoginRequest{
+		Email:     email,
+		Password:  password,
+		IP:        c.ClientIP(),
+		UserAgent: c.Request.UserAgent(),
+	})
 	if err != nil {
 		errMsg := "邮箱或密码错误"
-		if errors.Is(err, service.ErrUserNotActive) {
+		switch {
+		case errors.Is(err, service.ErrUserNotActive):
 			errMsg = "账号已被冻结"
+		case errors.Is(err, service.ErrTooManyAttempts):
+			errMsg = "登录失败次数过多，请稍后再试"
 		}
 		h.renderLoginPage(c, http.StatusUnauthorized, errMsg, returnTo)
 		return
@@ -222,10 +232,15 @@ func (h *OAuthHandler) Token(c *gin.Context) {
 		UserAgent:    c.Request.UserAgent(),
 	})
 	if err != nil {
-		status, code := service.HTTPStatusForOAuthError(err)
+		status, code, desc := service.HTTPStatusForOAuthError(err)
+		// 服务端错误用 slog 记原始 err；客户端只看到固定文案
+		if status >= 500 {
+			slog.Error("token endpoint internal error",
+				"err", err, "grant_type", grantType, "client_id", clientID)
+		}
 		c.JSON(status, gin.H{
 			"error":             code,
-			"error_description": err.Error(),
+			"error_description": desc,
 		})
 		return
 	}
@@ -451,6 +466,8 @@ func mapAuthorizeError(err error) string {
 		return "invalid_request"
 	case errors.Is(err, service.ErrInvalidRedirectURI):
 		return "invalid_request"
+	case errors.Is(err, service.ErrInvalidScope):
+		return "invalid_scope"
 	case errors.Is(err, service.ErrUnauthorizedClient):
 		return "unauthorized_client"
 	default:

@@ -144,6 +144,15 @@ func (s *OAuthService) IssueCode(ctx context.Context, req AuthorizeRequest, user
 		return nil, ErrInvalidRequest
 	}
 
+	// scope 必须是 client.AllowedScopes 的子集（OAuth 2.0 §3.3 + 防越权）
+	// 与 client_credentials 的过滤逻辑保持一致。
+	requestedScopes := SplitScope(req.Scope)
+	for _, sc := range requestedScopes {
+		if !contains(req.Client.AllowedScopes, sc) {
+			return nil, ErrInvalidScope
+		}
+	}
+
 	// 找 user 在 main 租户下的 membership（V0.2 简化）
 	mainTenant, err := s.tenants.FindByCode(ctx, "main")
 	if err != nil {
@@ -655,6 +664,13 @@ type BlocklistChecker interface {
 }
 
 // RevokeAccessToken 把 access_token 的 jti 加入黑名单。
+//
+// 三种 token 形态：
+//   - 用户 access_token：claims.Subject = user.public_id → 查 user.id 入黑名单
+//   - service token（client_credentials grant）：claims.Subject = client_id，
+//     不对应任何用户。我们仍要把 jti 入黑名单（防止泄露的 service token 滥用），
+//     此时 user_id 留 0 作为"非用户级"标记
+//   - 用户已删除：jti 仍入黑名单（user_id=0），不影响 token 失效
 func (s *OAuthService) RevokeAccessToken(ctx context.Context, token string, blocklist BlocklistAdder) error {
 	claims, err := s.signer.Verify(token)
 	if err != nil {
@@ -667,14 +683,15 @@ func (s *OAuthService) RevokeAccessToken(ctx context.Context, token string, bloc
 		return nil
 	}
 
-	// 找到 user_id（claims.Subject 是 public_id）
-	user, err := s.users.FindByPublicID(ctx, claims.Subject)
-	if err != nil {
-		return nil // 用户都没了就不用撤销
+	// 用户 token：claims.Subject 是 user public_id；查到映射 user.id
+	// service token：claims.Subject 是 client_id，查不到 → 用 0 作为占位
+	var userID uint64
+	if user, err := s.users.FindByPublicID(ctx, claims.Subject); err == nil {
+		userID = user.ID
 	}
 	return blocklist.Add(ctx, &model.JWTBlocklist{
 		JTI:       claims.ID,
-		UserID:    user.ID,
+		UserID:    userID,
 		Reason:    model.BlocklistReasonAdminRevoke,
 		RevokedAt: now,
 		ExpiresAt: claims.ExpiresAt.Time,
@@ -760,45 +777,6 @@ func filterInternalScopes(allowed []string) []string {
 	return out
 }
 
-// AuthenticatePassword 用密码验证身份（不创建 session/token，仅返回 user）。
-// 与 AuthService.Login 类似但不签 JWT；用于 oneauth 自己的登录页表单。
-// 重用 AuthService 的防爆破和登录尝试记录。
-func (s *OAuthService) AuthenticatePassword(ctx context.Context, email, password, ip, ua string) (*model.User, error) {
-	if email == "" || password == "" {
-		return nil, ErrInvalidCredential
-	}
-	auth, err := s.auths.FindByIdentifier(ctx, model.AuthTypeEmail, email)
-	if err != nil {
-		if repository.IsNotFound(err) {
-			return nil, ErrInvalidCredential
-		}
-		return nil, err
-	}
-	if auth.Credential == nil || !utils.CheckPassword(password, *auth.Credential) {
-		return nil, ErrInvalidCredential
-	}
-	user, err := s.users.FindByID(ctx, auth.UserID)
-	if err != nil {
-		return nil, err
-	}
-	if user.Status != model.UserStatusActive {
-		return nil, ErrUserNotActive
-	}
-	mainTenant, err := s.tenants.FindByCode(ctx, "main")
-	if err != nil {
-		return nil, err
-	}
-	ok, err := s.memberships.ExistsActive(ctx, user.ID, mainTenant.ID)
-	if err != nil {
-		return nil, err
-	}
-	if !ok {
-		return nil, ErrUserNotActive
-	}
-	_ = s.auths.MarkUsed(ctx, auth.ID)
-	return user, nil
-}
-
 // JWKS 暴露给 handler 用。
 func (s *OAuthService) JWKS() map[string]any {
 	return s.signer.JWKS()
@@ -827,27 +805,32 @@ func verifyPKCE(verifier, challenge, method string) bool {
 	}
 }
 
-// HTTPStatusForOAuthError 把 service 错误映射到 HTTP 状态。
-func HTTPStatusForOAuthError(err error) (int, string) {
+// HTTPStatusForOAuthError 把 service 错误映射到 HTTP 状态 + OAuth error code +
+// 固定的 error_description 文案。
+//
+// 不返回 err.Error() 给客户端（避免内部细节泄露——比如 PKCE 比对的具体长度、
+// wrap 链中的内部 path 等）。OAuth 2.0 §5.2 允许省略 error_description，但
+// 给客户端开发者一个稳定文案便于排错。
+func HTTPStatusForOAuthError(err error) (status int, code string, description string) {
 	switch {
 	case errors.Is(err, ErrInvalidClient):
-		return http.StatusUnauthorized, "invalid_client"
+		return http.StatusUnauthorized, "invalid_client", "client authentication failed"
 	case errors.Is(err, ErrInvalidGrant):
-		return http.StatusBadRequest, "invalid_grant"
+		return http.StatusBadRequest, "invalid_grant", "the provided grant is invalid, expired, or revoked"
 	case errors.Is(err, ErrInvalidRequest):
-		return http.StatusBadRequest, "invalid_request"
+		return http.StatusBadRequest, "invalid_request", "request is missing a required parameter or malformed"
 	case errors.Is(err, ErrUnauthorizedClient):
-		return http.StatusUnauthorized, "unauthorized_client"
+		return http.StatusUnauthorized, "unauthorized_client", "client not authorized for this grant type or resource"
 	case errors.Is(err, ErrUnsupportedGrant):
-		return http.StatusBadRequest, "unsupported_grant_type"
+		return http.StatusBadRequest, "unsupported_grant_type", "grant_type is not supported"
 	case errors.Is(err, ErrInvalidScope):
-		return http.StatusBadRequest, "invalid_scope"
+		return http.StatusBadRequest, "invalid_scope", "requested scope is not allowed for this client"
 	case errors.Is(err, ErrInvalidRedirectURI):
-		return http.StatusBadRequest, "invalid_redirect_uri"
+		return http.StatusBadRequest, "invalid_redirect_uri", "redirect_uri does not match registered URIs"
 	case errors.Is(err, ErrPKCEMismatch):
-		return http.StatusBadRequest, "invalid_grant"
+		return http.StatusBadRequest, "invalid_grant", "PKCE code_verifier does not match code_challenge"
 	default:
-		return http.StatusInternalServerError, "server_error"
+		return http.StatusInternalServerError, "server_error", "internal server error"
 	}
 }
 
