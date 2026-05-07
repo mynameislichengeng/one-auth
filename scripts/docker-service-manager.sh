@@ -17,8 +17,24 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT}"
 
+# 加载 .env.local：本脚本是 dev/local 运维入口（prod 在线运维不走这里）
+# 不存在时不 hard fail——down/status 不依赖 env；e2e/secrets 依赖时下游会报错
+ENV_FILE=".env.local"
+if [ -f "${ENV_FILE}" ]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "${ENV_FILE}"
+  set +a
+  DC_ENV="--env-file ${ENV_FILE}"
+else
+  DC_ENV=""
+fi
+
 # 所有 profile 一次性传给 docker compose（停止 / 状态用）
 ALL_PROFILES="--profile mysql --profile redis --profile blue --profile green"
+
+# docker compose 统一前缀：--env-file（消除 PASSWORD/DB_PASSWORD not set 警告）+ 全 profile
+DC="docker compose ${DC_ENV} ${ALL_PROFILES}"
 
 ensure_docker() {
   if ! docker info >/dev/null 2>&1; then
@@ -41,7 +57,7 @@ current_slot() {
 cmd_down() {
   ensure_docker
   # shellcheck disable=SC2086
-  docker compose ${ALL_PROFILES} down
+  ${DC} down
 }
 
 # 清空：停容器 + 清数据卷 + 清 docker/data/*
@@ -50,7 +66,7 @@ cmd_clean() {
   ensure_docker
   echo "==> 停所有容器并清卷"
   # shellcheck disable=SC2086
-  docker compose ${ALL_PROFILES} down -v
+  ${DC} down -v
   echo "==> 清 docker/data/*"
   rm -rf docker/data/mysql/* docker/data/redis/* docker/data/oneauth/* docker/data/nginx/slot.conf docker/data/nginx/slot.conf.bak
   # 保留 .gitkeep
@@ -73,13 +89,13 @@ cmd_logs() {
     echo "==> 跟随当前活跃槽日志: ${svc}"
   fi
   # shellcheck disable=SC2086
-  docker compose ${ALL_PROFILES} logs -f "${svc}"
+  ${DC} logs -f "${svc}"
 }
 
 cmd_status() {
   ensure_docker
   # shellcheck disable=SC2086
-  docker compose ${ALL_PROFILES} ps
+  ${DC} ps
   echo
   local slot
   slot=$(current_slot)
