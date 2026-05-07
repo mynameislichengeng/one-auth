@@ -43,8 +43,12 @@ x-oneauth: &oneauth-base
     # 部署元信息：每个公司部署值不同
     JWT_ISSUER: ${JWT_ISSUER:-oneauth-dev}
     PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
-    # Bootstrap admin 账号（暂保留占位符，下一轮讨论是否 hardcode）
-    BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:-admin@oneauth.local}
+    # Bootstrap admin 账号
+    # email: local 由 yaml hardcode；prod 必填部署元信息
+    #        没设时注入空字符串（${VAR:-} 和 ${VAR} 行为相同，但前者免 docker compose warning）
+    #        prod 忘填 → yaml 替换成空 → bootstrap 创建空 email user 失败 → 早 fail
+    # password: 永远是 secret，两端都走占位符
+    BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:-}
     BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD}
     # 槽位标识（注入到日志，便于运维排查当前请求落在哪个槽）
     DEPLOY_SLOT: ${DEPLOY_SLOT:-}

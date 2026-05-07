@@ -65,10 +65,11 @@ migration:
   enabled: true
 
 bootstrap:
+  # local 默认开启 bootstrap；admin 邮箱固定为 dev 占位
+  # 概念详见 lc_todo/05-tenancy-model.md Part 4：V0.3 admin SPA 上线后整段会被 Setup Wizard 替代
   enabled:            true
-  # admin 账号：邮箱 + 密码暂留占位符，下一轮讨论是否也 hardcode
-  admin_email:        ${BOOTSTRAP_ADMIN_EMAIL:-admin@oneauth.local}
-  admin_password:     ${BOOTSTRAP_ADMIN_PASSWORD}
+  admin_email:        admin@oneauth.local
+  admin_password:     ${BOOTSTRAP_ADMIN_PASSWORD}    # secret 仍走 .env.local
   admin_nickname:     "Platform Admin"
 
 log:
